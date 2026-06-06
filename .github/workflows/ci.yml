@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    name: Test py${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Run tests (first run - no cache)
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "=== First run: clean build (no cache) ==="
+          rm -rf build/
+          python test/run_all_tests.py
+
+      - name: Run tests (second run - with cache)
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "=== Second run: with cache ==="
+          python test/run_all_tests.py
+
+  test-windows:
+    name: Test on Windows
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Verify zig is available
+        run: |
+          python-zig version
+
+      - name: Run tests (first run - no cache)
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "=== First run: clean build (no cache) ==="
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          python test/run_all_tests.py
+
+      - name: Run tests (second run - with cache)
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "=== Second run: with cache ==="
+          python test/run_all_tests.py
+
+  lint:
+    name: Lint Check
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff
+
+      - name: Run Ruff linter
+        run: ruff check pcc/ --output-format=github || true
+
+      - name: Run Ruff formatter check
+        run: ruff format --check pcc/ || true

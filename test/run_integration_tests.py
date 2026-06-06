@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Run all integration tests
+
+This script runs all integration tests in test/ directory.
+Integration tests are Python scripts that compile and execute PC code.
+
+Usage:
+    python run_integration_tests.py           # Run in parallel (default)
+    python run_integration_tests.py --serial  # Run serially (for benchmarking)
+    python run_integration_tests.py --json    # Output JSON (for CI)
+"""
+
+import subprocess
+import sys
+import os
+import argparse
+import json
+from pathlib import Path
+from typing import Tuple, List, Dict, Any
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import time
+
+# Color codes for terminal output
+GREEN = '\033[92m'
+RED = '\033[91m'
+YELLOW = '\033[93m'
+BLUE = '\033[94m'
+RESET = '\033[0m'
+BOLD = '\033[1m'
+
+
+def run_single_test(test_file: Path, timeout: int = 300) -> Tuple[str, bool, str, str, float, int]:
+    """Run a single test file and return results.
+
+    Returns (name, success, stdout, stderr, duration, returncode).
+    """
+    test_name = test_file.stem
+    start_time = time.time()
+
+    # Use sys.executable for cross-platform compatibility
+    env = os.environ.copy()
+    workspace = str(Path(__file__).parent.parent)
+    if 'PYTHONPATH' in env:
+        env['PYTHONPATH'] = workspace + os.pathsep + env['PYTHONPATH']
+    else:
+        env['PYTHONPATH'] = workspace
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(test_file)],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=workspace,
+            env=env,
+            stdin=subprocess.DEVNULL
+        )
+        duration = time.time() - start_time
+        success = result.returncode == 0
+        return test_name, success, result.stdout, result.stderr, duration, result.returncode
+    except subprocess.TimeoutExpired:
+        duration = time.time() - start_time
+        return test_name, False, "", f"Test timed out after {timeout} seconds", duration, -1
+    except Exception as e:
+        duration = time.time() - start_time
+        return test_name, False, "", str(e), duration, -1
+
+
+def print_header(text: str, quiet: bool = False):
+    """Print a formatted header"""
+    if quiet:
+        return
+    print(f"\n{BOLD}{BLUE}{'='*70}{RESET}")
+    print(f"{BOLD}{BLUE}{text:^70}{RESET}")
+    print(f"{BOLD}{BLUE}{'='*70}{RESET}\n")
+
+
+def _print_failure_detail(stdout: str, stderr: str, returncode: int):
+    """Print full output for a failed test."""
+    print(f"    exit code: {returncode}")
+    if stdout.strip():
+        print(f"    {YELLOW}[stdout]{RESET}")
+        for line in stdout.strip().split('\n'):
+            print(f"    {line}")
+    if stderr.strip():
+        print(f"    {YELLOW}[stderr]{RESET}")
+        for line in stderr.strip().split('\n'):
+            print(f"    {line}")
+    if not stdout.strip() and not stderr.strip():
+        print(f"    (no output)")
+
+
+def run_tests_serial(test_files: List[Path], quiet: bool = False) -> List[Tuple[str, bool, str, str, float, int]]:
+    """Run tests serially (for accurate timing benchmarks)"""
+    results = []
+    for i, test_file in enumerate(test_files):
+        test_name, success, stdout, stderr, duration, rc = run_single_test(test_file)
+        if not quiet:
+            status = f"{GREEN}OK{RESET}" if success else f"{RED}FAIL{RESET}"
+            print(f"[{i+1}/{len(test_files)}] {status} {test_name} ({duration:.2f}s)")
+            if not success:
+                _print_failure_detail(stdout, stderr, rc)
+        results.append((test_name, success, stdout, stderr, duration, rc))
+    return results
+
+
+def run_tests_parallel(
+    test_files: List[Path],
+    max_workers: int = None,
+    quiet: bool = False,
+) -> List[Tuple[str, bool, str, str, float, int]]:
+    """Run tests in parallel (for faster execution)"""
+    if max_workers is None:
+        max_workers = min(8, os.cpu_count() or 4)
+
+    results = []
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_test = {
+            executor.submit(run_single_test, test_file): test_file.stem
+            for test_file in test_files
+        }
+
+        for future in as_completed(future_to_test):
+            test_name = future_to_test[future]
+            try:
+                name, success, stdout, stderr, duration, rc = future.result()
+                if not quiet:
+                    status = f"{GREEN}OK{RESET}" if success else f"{RED}FAIL{RESET}"
+                    print(f"{status} {name} ({duration:.2f}s)")
+                if not success and not quiet:
+                    _print_failure_detail(stdout, stderr, rc)
+                results.append((name, success, stdout, stderr, duration, rc))
+            except Exception as e:
+                if not quiet:
+                    print(f"{RED}FAIL{RESET} {test_name} (exception: {e})")
+                results.append((test_name, False, "", str(e), 0, -1))
+
+    return results
+
+
+def build_json_result(
+    total_tests: int,
+    passed: int,
+    failed: int,
+    wall_time: float,
+    total_cpu_time: float,
+    results: List[Tuple[str, bool, str, str, float, int]],
+) -> Dict[str, Any]:
+    """Build CI-friendly JSON output from integration test results."""
+    return {
+        'total': total_tests,
+        'passed': passed,
+        'failed': failed,
+        'wall_time_seconds': round(wall_time, 2),
+        'total_cpu_time_seconds': round(total_cpu_time, 2),
+        'tests': [
+            {
+                'name': name,
+                'passed': success,
+                'duration_seconds': round(duration, 3)
+            }
+            for name, success, _, _, duration, _ in results
+        ]
+    }
+
+
+def main():
+    """Main test runner"""
+    parser = argparse.ArgumentParser(description='Run pcc integration tests')
+    parser.add_argument('--serial', action='store_true',
+                        help='Run tests serially (for benchmarking)')
+    parser.add_argument('--json', action='store_true',
+                        help='Output results as JSON (for CI)')
+    parser.add_argument('--quiet', action='store_true',
+                        help='Minimal output (for benchmarking)')
+    args = parser.parse_args()
+
+    quiet_output = args.quiet or args.json
+    mode = "Serial" if args.serial else "Parallel"
+    print_header(f"pcc - Integration Test Suite ({mode})", quiet_output)
+
+    # Find all test files in test/ directory (top-level only, not utils/)
+    workspace = Path(__file__).parent.parent
+    test_dir = workspace / "test"
+    test_files = sorted(f for f in test_dir.glob("test_*.py") if f.parent == test_dir)
+
+    if not test_files:
+        if not args.quiet:
+            print(f"{YELLOW}No integration test files found{RESET}")
+        return 0
+
+    if not quiet_output:
+        print(f"Found {len(test_files)} integration test files")
+        if args.serial:
+            print(f"Running tests serially...\n")
+        else:
+            workers = min(8, os.cpu_count() or 4)
+            print(f"Running tests in parallel with {workers} workers...\n")
+
+    wall_start = time.time()
+
+    if args.serial:
+        results = run_tests_serial(test_files, quiet_output)
+    else:
+        results = run_tests_parallel(test_files, quiet=quiet_output)
+
+    wall_time = time.time() - wall_start
+
+    results.sort(key=lambda x: x[0])
+
+    passed = sum(1 for r in results if r[1])
+    failed = len(results) - passed
+    total_cpu_time = sum(r[4] for r in results)
+
+    if args.json:
+        json_result = build_json_result(
+            total_tests=len(test_files),
+            passed=passed,
+            failed=failed,
+            wall_time=wall_time,
+            total_cpu_time=total_cpu_time,
+            results=results,
+        )
+        print(json.dumps(json_result, indent=2))
+        return 0 if failed == 0 else 1
+
+    print_header("Test Summary", quiet_output)
+
+    if not quiet_output:
+        for test_name, success, stdout, stderr, duration, rc in results:
+            status = f"{GREEN}PASS{RESET}" if success else f"{RED}FAIL{RESET}"
+            print(f"{status} {test_name}")
+
+            if not success:
+                _print_failure_detail(stdout, stderr, rc)
+
+    total = len(test_files)
+    print(f"\n{BOLD}Total: {total}{RESET}")
+    print(f"{GREEN}Passed: {passed}{RESET}")
+    print(f"{RED}Failed: {failed}{RESET}")
+    print(f"{BLUE}Total CPU time: {total_cpu_time:.2f}s{RESET}")
+    print(f"{BLUE}Wall time: {wall_time:.2f}s{RESET}\n")
+
+    if failed == 0:
+        print(f"{GREEN}{BOLD} All integration tests passed!{RESET}\n")
+        return 0
+    else:
+        print(f"{RED}{BOLD} Some integration tests failed{RESET}\n")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

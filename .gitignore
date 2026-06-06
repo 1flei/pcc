@@ -1,0 +1,10 @@
+build
+*.pyc
+__pycache__
+.codebuddy
+backup
+.pytest_cache
+.vscode
+*.egg-info
+dist/
+.coverage

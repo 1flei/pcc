@@ -100,20 +100,16 @@ struct Point {
     printf("=== Struct ===\n%s\n", result)
     
     # Verify struct is generated correctly
-    if strstr(result, "@compile") == ptr[i8](0):
-        printf("FAIL: Expected @compile decorator\n")
+    if strstr(result, "Point = struct[") == ptr[i8](0):
+        printf("FAIL: Expected 'Point = struct['\n")
         strbuf_destroy(ptr(buf))
         return 1
-    if strstr(result, "class Point") == ptr[i8](0):
-        printf("FAIL: Expected 'class Point'\n")
+    if strstr(result, "\"x\": i32") == ptr[i8](0):
+        printf("FAIL: Expected '\"x\": i32'\n")
         strbuf_destroy(ptr(buf))
         return 1
-    if strstr(result, "x: i32") == ptr[i8](0):
-        printf("FAIL: Expected 'x: i32'\n")
-        strbuf_destroy(ptr(buf))
-        return 1
-    if strstr(result, "y: i32") == ptr[i8](0):
-        printf("FAIL: Expected 'y: i32'\n")
+    if strstr(result, "\"y\": i32") == ptr[i8](0):
+        printf("FAIL: Expected '\"y\": i32'\n")
         strbuf_destroy(ptr(buf))
         return 1
     
@@ -203,18 +199,18 @@ void DeleteTree(struct tn* tree);
     printf("=== Binary Tree Style ===\n%s\n", result)
     
     # Verify struct tn is generated
-    if strstr(result, "class tn") == ptr[i8](0):
-        printf("FAIL: Expected 'class tn'\n")
+    if strstr(result, "tn = struct[") == ptr[i8](0):
+        printf("FAIL: Expected 'tn = struct['\n")
         strbuf_destroy(ptr(buf))
         return 1
     
-    # Verify self-referential pointer fields
-    if strstr(result, "left: ptr[tn]") == ptr[i8](0):
-        printf("FAIL: Expected 'left: ptr[tn]'\n")
+    # Verify self-referential pointer fields (named struct pointees are quoted)
+    if strstr(result, "\"left\": ptr[\"tn\"]") == ptr[i8](0):
+        printf("FAIL: Expected '\"left\": ptr[\"tn\"]'\n")
         strbuf_destroy(ptr(buf))
         return 1
-    if strstr(result, "right: ptr[tn]") == ptr[i8](0):
-        printf("FAIL: Expected 'right: ptr[tn]'\n")
+    if strstr(result, "\"right\": ptr[\"tn\"]") == ptr[i8](0):
+        printf("FAIL: Expected '\"right\": ptr[\"tn\"]'\n")
         strbuf_destroy(ptr(buf))
         return 1
     
@@ -237,8 +233,8 @@ void DeleteTree(struct tn* tree);
         return 1
     
     # Verify return types
-    if strstr(result, "-> ptr[tn]") == ptr[i8](0):
-        printf("FAIL: Expected '-> ptr[tn]' return type\n")
+    if strstr(result, "-> ptr[\"tn\"]") == ptr[i8](0):
+        printf("FAIL: Expected '-> ptr[\"tn\"]' return type\n")
         strbuf_destroy(ptr(buf))
         return 1
     if strstr(result, "-> i64") == ptr[i8](0):
@@ -293,12 +289,12 @@ int printf(const char* format, ...);
     printf("=== Complex header ===\n%s\n", result)
     
     # Verify all declarations are present
-    if strstr(result, "class Point") == ptr[i8](0):
-        printf("FAIL: Expected 'class Point'\n")
+    if strstr(result, "Point = struct[") == ptr[i8](0):
+        printf("FAIL: Expected 'Point = struct['\n")
         strbuf_destroy(ptr(buf))
         return 1
-    if strstr(result, "class Rectangle") == ptr[i8](0):
-        printf("FAIL: Expected 'class Rectangle'\n")
+    if strstr(result, "Rectangle = struct[") == ptr[i8](0):
+        printf("FAIL: Expected 'Rectangle = struct['\n")
         strbuf_destroy(ptr(buf))
         return 1
     if strstr(result, "class Color") == ptr[i8](0):
@@ -356,8 +352,8 @@ const char* get_const_string(void);
         printf("FAIL: Expected '-> ptr[void]'\n")
         strbuf_destroy(ptr(buf))
         return 1
-    if strstr(result, "-> ptr[char]") == ptr[i8](0):
-        printf("FAIL: Expected '-> ptr[char]'\n")
+    if strstr(result, "-> ptr[i8]") == ptr[i8](0):
+        printf("FAIL: Expected '-> ptr[i8]'\n")
         strbuf_destroy(ptr(buf))
         return 1
     if strstr(result, "-> ptr[ptr[i32]]") == ptr[i8](0):
@@ -512,14 +508,14 @@ typedef enum Color { RED, GREEN, BLUE } Color;
         printf("FAIL: Expected 'size_t = u64'\n")
         strbuf_destroy(ptr(buf))
         return 1
-    if strstr(result, "string = ptr[char]") == ptr[i8](0):
-        printf("FAIL: Expected 'string = ptr[char]'\n")
+    if strstr(result, "string = ptr[i8]") == ptr[i8](0):
+        printf("FAIL: Expected 'string = ptr[i8]'\n")
         strbuf_destroy(ptr(buf))
         return 1
     
-    # Verify struct typedef
-    if strstr(result, "Point = Point") == ptr[i8](0):
-        printf("FAIL: Expected 'Point = Point' typedef\n")
+    # Verify struct typedef emits the aggregate definition under the tag/name
+    if strstr(result, "Point = struct[") == ptr[i8](0):
+        printf("FAIL: Expected 'Point = struct[' typedef\n")
         strbuf_destroy(ptr(buf))
         return 1
     

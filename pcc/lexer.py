@@ -27,6 +27,8 @@ class Lexer:
     line: i32                    # Current line number (1-based)
     col: i32                     # Current column number (1-based)
     length: i32                  # Total source length
+    file_start: ptr[i8]          # Origin file name (from cc -E line markers)
+    file_len: i32                # Length of the origin file name
 
 
 @compile
@@ -38,6 +40,8 @@ def lexer_create_raw(source: ptr[i8]) -> ptr[Lexer]:
     lex.line = 1
     lex.col = 1
     lex.length = strlen(source)
+    lex.file_start = nullptr
+    lex.file_len = 0
     return lex
 
 
@@ -120,14 +124,50 @@ def next_token_is_keyword(lex: LexerRef, keyword) -> bool:
 
 
 @compile
+def lexer_skip_line_marker(lex: LexerRef) -> void:
+    """Consume a preprocessor line at column 1 (cc -E line marker
+    `# N "file" flags`, or a surviving directive such as #pragma).
+
+    When the line is a line marker, the quoted file name is recorded as the
+    current origin file so declarations can be attributed to their source.
+    """
+    lexer_advance(lex)  # skip '#'
+    while lex.pos < lex.length and (lexer_current(lex) == char(" ") or lexer_current(lex) == char("\t")):
+        lexer_advance(lex)
+    # Optional decimal line number
+    while lex.pos < lex.length and isdigit(lexer_current(lex)):
+        lexer_advance(lex)
+    while lex.pos < lex.length and (lexer_current(lex) == char(" ") or lexer_current(lex) == char("\t")):
+        lexer_advance(lex)
+    # Optional quoted file name
+    if lex.pos < lex.length and lexer_current(lex) == char('"'):
+        lexer_advance(lex)  # opening quote
+        start_pos: i32 = lex.pos
+        while lex.pos < lex.length and lexer_current(lex) != char('"'):
+            lexer_advance(lex)
+        lex.file_start = lex.source + start_pos
+        lex.file_len = lex.pos - start_pos
+        if lex.pos < lex.length:
+            lexer_advance(lex)  # closing quote
+    # Discard the remainder of the directive line
+    while lex.pos < lex.length and lexer_current(lex) != char("\n"):
+        lexer_advance(lex)
+
+
+@compile
 def lexer_skip_whitespace(lex: LexerRef) -> void:
-    """Skip whitespace and comments"""
+    """Skip whitespace, comments, and preprocessor line markers"""
     while lex.pos < lex.length:
         c: i8 = lexer_current(lex)
         
         # Skip whitespace
         if isspace(c):
             lexer_advance(lex)
+            continue
+        
+        # Skip preprocessor lines (line markers / surviving directives)
+        if c == char("#") and lex.col == 1:
+            lexer_skip_line_marker(lex)
             continue
         
         # Skip // line comments
@@ -217,7 +257,8 @@ def lexer_read_number(lex: LexerRef, token: TokenRef) -> void:
         lexer_advance(lex)
         lexer_advance(lex)
     
-    # Read digits, dots, and hex letters
+    # Read digits, dots, hex letters, and exponents (with optional sign).
+    prev: i8 = 0
     while lex.pos < lex.length:
         c: i8 = lexer_current(lex)
         # Check if valid number character
@@ -225,8 +266,12 @@ def lexer_read_number(lex: LexerRef, token: TokenRef) -> void:
             lexer_advance(lex)
         elif (c >= char("A") and c <= char("F")) or (c >= char("a") and c <= char("f")):
             lexer_advance(lex)
+        elif (c == char("+") or c == char("-")) and (prev == char("e") or prev == char("E") or prev == char("p") or prev == char("P")):
+            # Signed exponent, e.g. 1e-5 / 0x1p+3
+            lexer_advance(lex)
         else:
             break
+        prev = c
 
     # Consume integer suffixes: u, U, l, L (e.g. 42UL, 0xFF'u', 1LL)
     while lex.pos < lex.length:

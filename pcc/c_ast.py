@@ -175,6 +175,9 @@ QUAL_RESTRICT: i8 = 4
 STORAGE_NONE: i8 = 0
 STORAGE_EXTERN: i8 = 1
 STORAGE_STATIC: i8 = 2
+# inline (with or without static/extern): such functions are header helpers
+# and are not emitted as definitions of this translation unit.
+STORAGE_INLINE: i8 = 3
 
 
 # =============================================================================
@@ -313,6 +316,7 @@ class Decl:
     type: ptr[QualType]
     storage: i8
     body: ptr['Stmt']
+    origin_file: Span            # Source file of the declaration (provenance)
 
 
 # =============================================================================
@@ -979,12 +983,13 @@ class Expr:
     kind: ExprKind
     op: i32              # Operator token type
     int_val: i64         # Integer literal value
-    span: Span           # Ident name / string text
+    span: Span           # Ident name / string text / numeric literal text
     lhs: ptr['Expr']     # Left operand / unary operand / callee
     rhs: ptr['Expr']     # Right operand
     extra: ptr['Expr']   # Ternary else branch
     args: ptr['Expr']    # Call argument array (contiguous)
     arg_count: i32
+    type_ref: ptr['QualType']  # Operand type for Cast / Sizeof / CompoundLit
 
 
 # Resolve Expr forward references (ptr['Expr'] -> ptr[Expr])
@@ -1007,6 +1012,7 @@ def expr_alloc() -> ptr[Expr]:
     e.extra = nullptr
     e.args = nullptr
     e.arg_count = 0
+    e.type_ref = nullptr
     return e
 
 
@@ -1034,6 +1040,8 @@ def _expr_free_contents(e: ptr[Expr]) -> void:
             _expr_free_contents(ptr(e.args[i]))
             i = i + 1
         effect.mem.free(e.args)
+    if e.type_ref != nullptr:
+        _qualtype_free_deep(e.type_ref)
 
 
 @compile
@@ -1052,6 +1060,8 @@ def expr_free_deep(e: ptr[Expr]) -> void:
             _expr_free_contents(ptr(e.args[i]))
             i = i + 1
         effect.mem.free(e.args)
+    if e.type_ref != nullptr:
+        _qualtype_free_deep(e.type_ref)
     effect.mem.free(e)
 
 

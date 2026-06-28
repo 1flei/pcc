@@ -17,16 +17,17 @@ parse_declarations is a yield-based @compile function.
 """
 
 from pythoc import (
-    compile, i32, i64, i8, ptr, void, char, nullptr
+    compile, i32, i64, i8, u64, ptr, void, char, nullptr
 )
 from pythoc.libc.stdio import (
     fopen, fclose, fwrite, fprintf, fseek, ftell, fread
 )
 from pythoc.libc.stdlib import malloc, free
 from pythoc.libc.string import strlen
+from pythoc.std.vector import Vector
 
 from .c_parser import parse_declarations
-from .c_ast import decl_free, Decl, DeclKind, Span
+from .c_ast import decl_free, Decl, DeclKind, Span, span_eq
 from .pythoc_backend import (
     StringBuffer, strbuf_init, strbuf_destroy, strbuf_to_cstr,
     emit_module_header, emit_module_footer, emit_decl, strbuf_size
@@ -36,6 +37,12 @@ from .pythoc_backend import (
 # Emission modes for origin-filtered generation.
 _MODE_TYPES: i32 = 0   # aggregates + typedefs (interface modules from .h)
 _MODE_IMPL: i32 = 1    # functions + variables + file-local types (.c modules)
+
+# Growable set of function names (zero-copy Spans into the source text) used to
+# drop a forward prototype when the same translation unit also defines it. A
+# small inline capacity keeps tiny units allocation-free; larger ones spill to
+# the heap automatically.
+_FuncNames = Vector(Span, 16)
 
 
 @compile
@@ -129,83 +136,131 @@ def _write_manifest_line(fp: ptr[i8], decl: ptr[Decl]) -> void:
 
 
 @compile
-def generate_bindings(source: ptr[i8], lib: ptr[i8]) -> ptr[i8]:
-    """Generate pythoc bindings from C source text.
-    
-    Args:
-        source: C source text (null-terminated)
-        lib: Library name for @extern decorators (null-terminated)
-    
-    Returns:
-        Pointer to generated pythoc source code (null-terminated).
-        Caller is responsible for freeing this memory.
-    """
-    buf: StringBuffer
-    strbuf_init(ptr(buf))
-    
-    # Emit module header with imports
-    emit_module_header(ptr(buf))
-    
-    # Parse and emit each declaration
-    for decl_prf, decl in parse_declarations(source):
-        emit_decl(ptr(buf), decl, lib)
-        decl_free(decl_prf, decl)
-    
-    emit_module_footer(ptr(buf))
-    
-    # Get result as C string
-    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
-    
-    # Note: We return pointer to buffer's internal storage.
-    # The caller must copy this before the buffer is destroyed.
-    # For file writing, we write directly before destroying.
-    
-    return result
+def _is_func_proto(decl: ptr[Decl]) -> i8:
+    """Whether a declaration is a bare function prototype (no body)."""
+    match decl.kind:
+        case DeclKind.Func:
+            if decl.body == nullptr:
+                return 1
+            return 0
+        case _:
+            return 0
 
 
 @compile
-def generate_bindings_to_file(source: ptr[i8], lib: ptr[i8], output_path: ptr[i8]) -> i32:
+def _decl_in_scope(decl: ptr[Decl], target: ptr[i8], use_filter: i32) -> i8:
+    """Whether a declaration belongs to the unit being emitted."""
+    if use_filter == 0:
+        return 1
+    return _origin_basename_eq(decl.origin_file, target)
+
+
+@compile
+def _name_recorded(defined: ptr[_FuncNames.type], name: Span) -> i8:
+    """Whether a function name was recorded as locally defined."""
+    i: u64 = 0
+    n: u64 = _FuncNames.size(defined)
+    while i < n:
+        if span_eq(_FuncNames.get(defined, i), name):
+            return 1
+        i = i + 1
+    return 0
+
+
+@compile
+def _should_emit(decl: ptr[Decl], defined: ptr[_FuncNames.type],
+                 target: ptr[i8], mode: i32, use_filter: i32) -> i8:
+    """Selection predicate, evaluated entirely from the declaration value.
+
+    Skips out-of-unit declarations, ones not selected for the module mode, and a
+    bare prototype whose function the unit also defines (which would otherwise
+    emit both an @extern and the @compile def for one name).
+    """
+    if _decl_in_scope(decl, target, use_filter) == 0:
+        return 0
+    if _decl_selected(decl, mode) == 0:
+        return 0
+    if _is_func_proto(decl) != 0 and _name_recorded(defined, decl.name) != 0:
+        return 0
+    return 1
+
+
+@compile
+def _load_def_names(defs_text: ptr[i8], out: ptr[_FuncNames.type]) -> void:
+    """Populate `out` with newline-separated function names from `defs_text`.
+
+    The names stay zero-copy Spans into `defs_text`, so that buffer must outlive
+    `out`. This is a plain string split - it deliberately does NOT reparse C, so
+    the emitter keeps a single parse_declarations loop (the yield-based parser
+    threads a linear proof that cannot survive a second loop in one function).
+    """
+    i: i32 = 0
+    start: i32 = 0
+    while defs_text[i] != 0:
+        if defs_text[i] == char("\n"):
+            if i > start:
+                nm: Span
+                nm.start = defs_text + start
+                nm.len = i - start
+                _FuncNames.push_back(out, nm)
+            start = i + 1
+        i = i + 1
+    if i > start:
+        tail: Span
+        tail.start = defs_text + start
+        tail.len = i - start
+        _FuncNames.push_back(out, tail)
+
+
+@compile
+def generate_bindings_to_file(source: ptr[i8], lib: ptr[i8], output_path: ptr[i8],
+                              defs_text: ptr[i8]) -> i32:
     """Generate pythoc bindings and write to file.
-    
+
     Args:
         source: C source text (null-terminated)
         lib: Library name for @extern decorators (null-terminated)
         output_path: Path to output .py file (null-terminated)
-    
+        defs_text: newline-separated names of functions defined in this unit
+            (null to suppress nothing); used to drop redundant prototypes.
+
     Returns:
         0 on success, non-zero on error
     """
+    defined: _FuncNames.type
+    _FuncNames.init(ptr(defined))
+    if defs_text != nullptr:
+        _load_def_names(defs_text, ptr(defined))
+
     buf: StringBuffer
     strbuf_init(ptr(buf))
-    
-    # Emit module header with imports
     emit_module_header(ptr(buf))
-    
-    # Parse and emit each declaration
+
+    # Whole file, no origin filter; skip prototypes the file also defines.
     for decl_prf, decl in parse_declarations(source):
-        emit_decl(ptr(buf), decl, lib)
+        if _should_emit(decl, ptr(defined), nullptr, _MODE_IMPL, 0) != 0:
+            emit_decl(ptr(buf), decl, lib)
         decl_free(decl_prf, decl)
-    
+
     emit_module_footer(ptr(buf))
-    
-    # Get result as C string
+
     result: ptr[i8] = strbuf_to_cstr(ptr(buf))
     size: i64 = strbuf_size(ptr(buf))
-    
-    # Write to file
+
     fp: ptr[i8] = fopen(output_path, "w")
     if fp == nullptr:
         strbuf_destroy(ptr(buf))
+        _FuncNames.destroy(ptr(defined))
         return 1
-    
-    # Don't include null terminator in write
+
     written: i64 = fwrite(result, 1, size - 1, fp)
     fclose(fp)
     strbuf_destroy(ptr(buf))
-    
+    _FuncNames.destroy(ptr(defined))
+
     if written != size - 1:
         return 2
-    
+
     return 0
 
 
@@ -240,35 +295,49 @@ def read_file_to_cstr(path: ptr[i8]) -> ptr[i8]:
 
 
 @compile
-def generate_bindings_file(input_path: ptr[i8], lib: ptr[i8], output_path: ptr[i8]) -> i32:
+def generate_bindings_file(input_path: ptr[i8], lib: ptr[i8],
+                           output_path: ptr[i8], defs_path: ptr[i8]) -> i32:
     """Read C source from a file, generate a PythoC module, write it out.
 
     All arguments stay native (file contents are read inside compiled code),
     avoiding any Python-string-to-pointer marshalling at the call boundary.
+    `defs_path` (may be empty) lists this unit's defined function names so that
+    redundant forward prototypes are not also emitted as @extern.
     """
     source: ptr[i8] = read_file_to_cstr(input_path)
     if source == nullptr:
         return 3
-    rc: i32 = generate_bindings_to_file(source, lib, output_path)
+    defs_text: ptr[i8] = nullptr
+    if defs_path != nullptr and defs_path[0] != 0:
+        defs_text = read_file_to_cstr(defs_path)
+    rc: i32 = generate_bindings_to_file(source, lib, output_path, defs_text)
+    if defs_text != nullptr:
+        free(defs_text)
     free(source)
     return rc
 
 
 @compile
 def generate_body_to_file(source: ptr[i8], target: ptr[i8], mode: i32,
-                          lib: ptr[i8], output_path: ptr[i8]) -> i32:
+                          lib: ptr[i8], output_path: ptr[i8],
+                          defs_text: ptr[i8]) -> i32:
     """Emit only the declarations originating in `target`, in `mode`.
 
     Writes just the module body (no header/footer/imports); the driver
-    assembles the full module around it.
+    assembles the full module around it. `defs_text` (newline-separated, may be
+    null) names the unit's defined functions so their prototypes are skipped.
     """
+    defined: _FuncNames.type
+    _FuncNames.init(ptr(defined))
+    if defs_text != nullptr:
+        _load_def_names(defs_text, ptr(defined))
+
     buf: StringBuffer
     strbuf_init(ptr(buf))
 
     for decl_prf, decl in parse_declarations(source):
-        if _origin_basename_eq(decl.origin_file, target) != 0:
-            if _decl_selected(decl, mode) != 0:
-                emit_decl(ptr(buf), decl, lib)
+        if _should_emit(decl, ptr(defined), target, mode, 1) != 0:
+            emit_decl(ptr(buf), decl, lib)
         decl_free(decl_prf, decl)
 
     result: ptr[i8] = strbuf_to_cstr(ptr(buf))
@@ -277,10 +346,12 @@ def generate_body_to_file(source: ptr[i8], target: ptr[i8], mode: i32,
     fp: ptr[i8] = fopen(output_path, "w")
     if fp == nullptr:
         strbuf_destroy(ptr(buf))
+        _FuncNames.destroy(ptr(defined))
         return 1
     written: i64 = fwrite(result, 1, size - 1, fp)
     fclose(fp)
     strbuf_destroy(ptr(buf))
+    _FuncNames.destroy(ptr(defined))
     if written != size - 1:
         return 2
     return 0
@@ -288,12 +359,19 @@ def generate_body_to_file(source: ptr[i8], target: ptr[i8], mode: i32,
 
 @compile
 def generate_body_file(input_path: ptr[i8], target: ptr[i8], mode: i32,
-                       lib: ptr[i8], output_path: ptr[i8]) -> i32:
+                       lib: ptr[i8], output_path: ptr[i8],
+                       defs_path: ptr[i8]) -> i32:
     """File-to-file wrapper for generate_body_to_file."""
     source: ptr[i8] = read_file_to_cstr(input_path)
     if source == nullptr:
         return 3
-    rc: i32 = generate_body_to_file(source, target, mode, lib, output_path)
+    defs_text: ptr[i8] = nullptr
+    if defs_path != nullptr and defs_path[0] != 0:
+        defs_text = read_file_to_cstr(defs_path)
+    rc: i32 = generate_body_to_file(source, target, mode, lib, output_path,
+                                    defs_text)
+    if defs_text != nullptr:
+        free(defs_text)
     free(source)
     return rc
 

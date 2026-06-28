@@ -82,11 +82,12 @@ from pcc.bindgen import generate_bindings_file
 _INPUT = {input!r}
 _LIB = {lib!r}
 _OUTPUT = {output!r}
+_DEFS = {defs!r}
 
 
 @compile
 def _pcc_generate() -> i32:
-    return generate_bindings_file(_INPUT, _LIB, _OUTPUT)
+    return generate_bindings_file(_INPUT, _LIB, _OUTPUT, _DEFS)
 
 
 if __name__ == "__main__":
@@ -101,7 +102,7 @@ def generate_module(preprocessed_path, module_path, lib="c"):
     string literals, so no runtime string crosses the Python/native boundary.
     """
     launcher_src = _GEN_LAUNCHER.format(
-        input=preprocessed_path, lib=lib, output=module_path
+        input=preprocessed_path, lib=lib, output=module_path, defs=""
     )
     fd, launcher_path = tempfile.mkstemp(prefix="pcc_gen_", suffix=".py")
     with os.fdopen(fd, "w") as f:
@@ -214,11 +215,12 @@ _TARGET = {target!r}
 _MODE = {mode}
 _LIB = {lib!r}
 _OUTPUT = {output!r}
+_DEFS = {defs!r}
 
 
 @compile
 def _pcc_gen_body() -> i32:
-    return generate_body_file(_INPUT, _TARGET, _MODE, _LIB, _OUTPUT)
+    return generate_body_file(_INPUT, _TARGET, _MODE, _LIB, _OUTPUT, _DEFS)
 
 
 if __name__ == "__main__":
@@ -312,6 +314,24 @@ def _resolve_header(name, search_dirs):
     return None
 
 
+def _transitive_headers(direct_includes, header_includes):
+    """Transitive closure of project headers reachable from direct includes.
+
+    `header_includes` maps a header basename to its own (project, system)
+    includes; walking the project edges yields every header a source pulls in,
+    directly or indirectly.
+    """
+    seen = set()
+    pending = list(direct_includes)
+    while pending:
+        h = pending.pop()
+        if h in seen:
+            continue
+        seen.add(h)
+        pending.extend(header_includes.get(h, ([], []))[0])
+    return seen
+
+
 def _parse_manifest(manifest_path):
     """Yield (origin, kind, name, has_body) records from a manifest file."""
     with open(manifest_path) as f:
@@ -324,6 +344,23 @@ def _parse_manifest(manifest_path):
                 continue
             origin, kind, name, has_body = parts
             yield origin, kind, name, has_body == "1"
+
+
+def _write_local_defs(manifest_path, origin_basename, defs_path):
+    """Write the names of functions defined in `origin_basename` to a file.
+
+    The implementation emitter reads this to drop a forward prototype when the
+    same unit also defines the function (otherwise both an @extern declaration
+    and the @compile def are emitted for one name).
+    """
+    names = sorted({
+        name
+        for origin, kind, name, has_body in _parse_manifest(manifest_path)
+        if kind == "func" and has_body and name and origin == origin_basename
+    })
+    with open(defs_path, "w") as f:
+        f.write("\n".join(names))
+    return defs_path
 
 
 def compile_project(sources, output=None, emit=_EMIT_EXE, cpp=None,
@@ -367,11 +404,13 @@ def compile_project(sources, output=None, emit=_EMIT_EXE, cpp=None,
 
         stem = _module_stem(src)
         impl_modules[src] = stem
+        defs_path = os.path.join(workdir, "%s.defs" % base)
+        _write_local_defs(manifest_path, os.path.basename(src), defs_path)
         body_path = os.path.join(workdir, "%s.body" % stem)
         _run_launcher(
             _BODY_LAUNCHER.format(
                 input=pp_path, target=os.path.basename(src),
-                mode=_MODE_IMPL, lib="c", output=body_path,
+                mode=_MODE_IMPL, lib="c", output=body_path, defs=defs_path,
             ),
             expect_path=body_path,
         )
@@ -410,20 +449,28 @@ def compile_project(sources, output=None, emit=_EMIT_EXE, cpp=None,
                     func_decls.setdefault(origin, set()).add(name)
 
     # Emit interface bodies for each project header, reusing a .i that includes
-    # it (any .c that references it).
+    # it. The header's declarations only appear (with the right origin markers)
+    # in a preprocessed source that pulls it in, so a source must be chosen
+    # whose *transitive* include closure contains the header - a header that is
+    # only included indirectly has no direct includer, and falling back to
+    # sources[0] would emit it from a .i that never saw it.
+    src_closures = {
+        s: _transitive_headers(_scan_includes(s)[0], header_includes)
+        for s in sources
+    }
     header_modules = {}  # header basename -> module stem
     for h, hpath in project_headers.items():
         stem = _module_stem(hpath)
         header_modules[h] = stem
-        # Pick the preprocessed source that includes this header.
+        # Pick a preprocessed source that (transitively) includes this header.
         src_for_h = next(
-            (s for s in sources if h in _scan_includes(s)[0]), sources[0]
+            (s for s in sources if h in src_closures[s]), sources[0]
         )
         body_path = os.path.join(workdir, "%s.body" % stem)
         _run_launcher(
             _BODY_LAUNCHER.format(
                 input=pp_paths[src_for_h], target=h,
-                mode=_MODE_TYPES, lib="c", output=body_path,
+                mode=_MODE_TYPES, lib="c", output=body_path, defs="",
             ),
             expect_path=body_path,
         )
@@ -465,36 +512,34 @@ def _compute_imports(proj_inc, sys_inc, this_module, header_modules,
     transitively through project headers so typedef names like size_t resolve
     even when only pulled in indirectly.
     """
-    lines = []
-    by_module = {}  # defining module -> set of function names to import
+    # A module sees every header it includes directly or indirectly, so symbols
+    # must be imported from the whole transitive closure - a type declared in a
+    # base header reached only through an umbrella header is still referenced.
+    proj_all = _transitive_headers(proj_inc, header_includes)
 
-    for h in proj_inc:
+    type_imports = {}  # header module -> set of type names to import
+    by_module = {}     # defining module -> set of function names to import
+    for h in proj_all:
         hmod = header_modules.get(h)
-        if hmod is None:
-            continue
-        tnames = sorted(type_names.get(h, ()))
-        if tnames and hmod != this_module:
-            lines.append("from %s import %s" % (hmod, ", ".join(tnames)))
+        if hmod is not None and hmod != this_module:
+            for t in type_names.get(h, ()):
+                type_imports.setdefault(hmod, set()).add(t)
         for fn in func_decls.get(h, ()):
             defmod = func_def_module.get(fn)
             if defmod and defmod != this_module:
                 by_module.setdefault(defmod, set()).add(fn)
 
+    lines = []
+    for hmod in sorted(type_imports):
+        lines.append("from %s import %s"
+                     % (hmod, ", ".join(sorted(type_imports[hmod]))))
     for defmod in sorted(by_module):
         lines.append("from %s import %s"
                      % (defmod, ", ".join(sorted(by_module[defmod]))))
 
     sys_all = set(sys_inc)
-    seen = set()
-    pending = list(proj_inc)
-    while pending:
-        h = pending.pop()
-        if h in seen:
-            continue
-        seen.add(h)
-        hp, hs = header_includes.get(h, ([], []))
-        sys_all.update(hs)
-        pending.extend(hp)
+    for h in proj_all:
+        sys_all.update(header_includes.get(h, ([], []))[1])
 
     for s in sorted(sys_all):
         mod = _LIBC_MAP.get(os.path.splitext(s)[0])

@@ -233,6 +233,10 @@ g_token_alias_to_id = {
     "__restrict": TokenType.RESTRICT,
     "__restrict__": TokenType.RESTRICT,
     "restrict": TokenType.RESTRICT,
+    # auto/register are ignorable storage-class hints; treat like a no-op
+    # qualifier (RESTRICT) so they are skipped wherever a declaration begins.
+    "register": TokenType.RESTRICT,
+    "auto": TokenType.RESTRICT,
     "__inline__": TokenType.INLINE,
     "__inline": TokenType.INLINE,
     "inline": TokenType.INLINE,

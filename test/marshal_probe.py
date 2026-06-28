@@ -12,7 +12,7 @@ SRC = "int add(int a, int b);\n"
 
 def try_variant(name, source, lib, out):
     try:
-        rc = generate_bindings_to_file(source, lib, out)
+        rc = generate_bindings_to_file(source, lib, out, None)
         ok = os.path.exists("/tmp/probe_out.py")
         print("%-20s rc=%r exists=%r" % (name, rc, ok))
         if ok:

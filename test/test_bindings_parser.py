@@ -413,6 +413,35 @@ def test_array_of_func_ptrs() -> i32:
 
 
 @compile
+def test_func_ptr_param_after_param() -> i32:
+    """Regression: a function-pointer parameter preceded by other parameters.
+
+    Parsing the nested parameter list must not clobber the outer in-progress
+    params. A shared scratch buffer previously corrupted memory here and
+    crashed when the resulting type tree was freed. Verify the outer function
+    keeps all 3 params and that decl_free is clean.
+    """
+    src = ("void reg(void *s, void *ctx, "
+           "void (*cb)(void *a, const char *b, const void *c));")
+    found: i32 = 0
+    for decl_prf, decl in parse_declarations(src):
+        match decl.kind[0]:
+            case DeclKind.Func:
+                if span_eq_cstr(decl.name, "reg"):
+                    for qt in refine(decl.type, qualtype_nonnull):
+                        match qt.type[0]:
+                            case (CType.Func, ft):
+                                if ft != nullptr and ft.param_count == 3:
+                                    found = 1
+                            case _:
+                                pass
+            case _:
+                pass
+        decl_free(decl_prf, decl)
+    return found
+
+
+@compile
 def test_for_loop_with_decl_body() -> i32:
     """Test for-loop init decl in function body parses correctly."""
     src = "void f() { for (int i = 0; i < 10; i++) { } }"
@@ -745,6 +774,12 @@ def main() -> i32:
 
     printf("test_array_of_func_ptrs: ")
     result = test_array_of_func_ptrs()
+    printf("%d\n", result)
+    if result != 1:
+        return 1
+
+    printf("test_func_ptr_param_after_param: ")
+    result = test_func_ptr_param_after_param()
     printf("%d\n", result)
     if result != 1:
         return 1

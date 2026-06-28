@@ -531,6 +531,382 @@ typedef enum Color { RED, GREEN, BLUE } Color;
 
 
 @compile
+def test_global_vars() -> i32:
+    """File-scope globals lower to static[T]+accessor and references rewrite."""
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int g_count = 5;
+int *g_ptr = 0;
+int g_zero;
+int read_count(void) { return g_count; }
+int compute(int g_count) { return g_count + 1; }
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Global Vars ===\n%s\n", result)
+
+    # Accessor with the integer initializer.
+    if strstr(result, "def _pcc_g_g_count() -> ptr[i32]:") == ptr[i8](0):
+        printf("FAIL: missing g_count accessor\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "s: static[i32] = 5") == ptr[i8](0):
+        printf("FAIL: missing g_count static seed\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Pointer initialized with C's 0 becomes nullptr.
+    if strstr(result, "s: static[ptr[i32]] = nullptr") == ptr[i8](0):
+        printf("FAIL: pointer global not seeded with nullptr\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Tentative definition is zero-seeded.
+    if strstr(result, "def _pcc_g_g_zero() -> ptr[i32]:") == ptr[i8](0):
+        printf("FAIL: missing g_zero accessor\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # A real global reference rewrites to the accessor deref.
+    if strstr(result, "return _pcc_g_g_count()[0]") == ptr[i8](0):
+        printf("FAIL: global reference not rewritten\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # A parameter shadowing the global keeps the bare name.
+    if strstr(result, "return (g_count + 1)") == ptr[i8](0):
+        printf("FAIL: shadowing parameter was wrongly rewritten\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "_pcc_g_g_count()[0] + 1") != ptr[i8](0):
+        printf("FAIL: shadowed param must not use the accessor\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_global_vars\n\n")
+    return 0
+
+
+@compile
+def test_aggregate_globals() -> i32:
+    """Uninitialized aggregate globals lower to a seedless static[T] slot.
+
+    Arrays/structs/unions have no scalar zero, so PythoC implicitly zero-inits
+    the static storage; the accessor must declare `s: static[T]` with no seed
+    rather than emitting the __pcc_unsupported__ sentinel it used to.
+    """
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int g_table[4];
+char g_name[16];
+struct Point { int x; int y; };
+struct Point g_origin;
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Aggregate Globals ===\n%s\n", result)
+
+    # Array global: seedless static slot, no scalar seed, no sentinel.
+    if strstr(result, "s: static[array[i32, 4]]\n") == ptr[i8](0):
+        printf("FAIL: array global not lowered to seedless static slot\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "s: static[array[i8, 16]]\n") == ptr[i8](0):
+        printf("FAIL: char-array global not lowered to seedless static slot\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Struct global likewise gets a seedless slot.
+    if strstr(result, "def _pcc_g_g_origin() -> ptr[Point]:") == ptr[i8](0):
+        printf("FAIL: missing struct global accessor\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # The aggregate zero-init path must not leak the unsupported sentinel.
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: aggregate global leaked __pcc_unsupported__\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_aggregate_globals\n\n")
+    return 0
+
+
+@compile
+def test_aggregate_initializers() -> i32:
+    """Explicit aggregate initializers: positional lists lower to a seed;
+    designated initializers are rejected loudly rather than misassigned.
+    """
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int g_tab[3] = {1, 2, 3};
+struct Pt { int x; int y; };
+struct Pt g_pt = {4, 5};
+int g_desig[3] = {[1] = 9};
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Aggregate Initializers ===\n%s\n", result)
+
+    # Positional array initializer keeps its constant seed.
+    if strstr(result, "s: static[array[i32, 3]] = (1, 2, 3)") == ptr[i8](0):
+        printf("FAIL: positional array initializer not seeded\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Positional struct initializer is captured (not dropped) and seeded.
+    if strstr(result, "s: static[Pt] = (4, 5)") == ptr[i8](0):
+        printf("FAIL: struct initializer dropped or not seeded\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Designated initializer must be rejected loudly, never misassigned.
+    if strstr(result, "__pcc_unsupported__") == ptr[i8](0):
+        printf("FAIL: designated initializer was not rejected\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_aggregate_initializers\n\n")
+    return 0
+
+
+@compile
+def test_goto_lowering() -> i32:
+    """C goto/label reconstructs onto scoped label/goto/goto_end."""
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int classify(int x) {
+    int result = 0;
+    if (x < 0) goto neg;
+    result = 1;
+    goto done;
+neg:
+    result = -1;
+done:
+    return result;
+}
+int sum_to(int n) {
+    int i = 1;
+    int total = 0;
+loop:
+    if (i > n) goto end;
+    total = total + i;
+    i = i + 1;
+    goto loop;
+end:
+    return total;
+}
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Goto Lowering ===\n%s\n", result)
+
+    # Forward gotos to ordered cleanup labels become scoped goto_end.
+    if strstr(result, "with label(\"done\"):") == ptr[i8](0):
+        printf("FAIL: missing 'done' label scope\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "goto_end(\"done\")") == ptr[i8](0):
+        printf("FAIL: forward goto not lowered to goto_end\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "goto_end(\"neg\")") == ptr[i8](0):
+        printf("FAIL: forward goto 'neg' not lowered\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # A backward loop goto becomes scoped goto (jump to begin).
+    if strstr(result, "goto(\"loop\")") == ptr[i8](0):
+        printf("FAIL: backward goto not lowered to goto\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Nothing was rejected; the unsupported sentinel must be absent.
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: supported goto shapes leaked __pcc_unsupported__\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_goto_lowering\n\n")
+    return 0
+
+
+@compile
+def test_goto_state_machine() -> i32:
+    """Irreducible goto lowers to a __pcc_pc state machine, not a loud failure.
+
+    `mid` is targeted both forward (before it) and backward (after it); no
+    single scoped label can represent it, so the whole function dissolves into a
+    state-machine dispatch instead of emitting the unsupported sentinel.
+    """
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int f(int x) {
+    if (x == 5) goto mid;
+    x = x + 1;
+mid:
+    x = x + 1;
+    if (x < 10) goto mid;
+    return x;
+}
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Goto State Machine ===\n%s\n", result)
+
+    # The both-direction label is now handled by state-machine lowering.
+    if strstr(result, "__pcc_pc: i32 = 0") == ptr[i8](0):
+        printf("FAIL: irreducible goto did not lower to a state machine\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "while True:") == ptr[i8](0):
+        printf("FAIL: state machine missing dispatch loop\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Nothing was rejected and no scoped label was emitted for the function.
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: state machine leaked __pcc_unsupported__\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "with label(\"mid\")") != ptr[i8](0):
+        printf("FAIL: irreducible label must not become a scope\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_goto_state_machine\n\n")
+    return 0
+
+
+@compile
+def test_goto_into_switch() -> i32:
+    """A goto from one switch case to a label inside another case forces the
+    whole function into the state machine (emit_switch cannot scope labels)."""
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int pick(int k, int x) {
+    switch (k) {
+        case 1:
+            x = 10;
+        set_it:
+            x = x + 1;
+            break;
+        case 2:
+            x = 20;
+            goto set_it;
+        default:
+            x = 0;
+    }
+    return x;
+}
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Goto Into Switch ===\n%s\n", result)
+
+    if strstr(result, "__pcc_pc: i32 = 0") == ptr[i8](0):
+        printf("FAIL: cross-case goto did not lower to a state machine\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: cross-case goto leaked __pcc_unsupported__\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_goto_into_switch\n\n")
+    return 0
+
+
+@compile
+def test_storage_class_hints() -> i32:
+    """register/auto are ignorable storage-class hints, not identifiers.
+
+    They appear on locals and parameters in real C (e.g. tinycc's libtcc1.c);
+    the parser must skip them so the declaration lowers as a plain variable
+    rather than leaking a bare `register`/`auto` name into the output.
+    """
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int f(register int a) {
+    register int exp = a + 1;
+    auto int y = exp;
+    return y;
+}
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Storage Class Hints ===\n%s\n", result)
+
+    # The register parameter lowers to a normal typed parameter.
+    if strstr(result, "a: i32") == ptr[i8](0):
+        printf("FAIL: register parameter not lowered\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # register/auto locals lower to plain typed locals.
+    if strstr(result, "exp: i32") == ptr[i8](0):
+        printf("FAIL: register local not lowered\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "y: i32") == ptr[i8](0):
+        printf("FAIL: auto local not lowered\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # The hint keywords must never survive as emitted identifiers.
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: storage-class hint leaked __pcc_unsupported__\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_storage_class_hints\n\n")
+    return 0
+
+
+@compile
 def main() -> i32:
     printf("=== Pythoc Backend Tests ===\n\n")
     
@@ -545,6 +921,13 @@ def main() -> i32:
     failed = failed + test_pointer_types()
     failed = failed + test_c_source_file()
     failed = failed + test_typedef_variants()
+    failed = failed + test_global_vars()
+    failed = failed + test_aggregate_globals()
+    failed = failed + test_aggregate_initializers()
+    failed = failed + test_goto_lowering()
+    failed = failed + test_goto_state_machine()
+    failed = failed + test_goto_into_switch()
+    failed = failed + test_storage_class_hints()
     
     if failed > 0:
         printf("\n%d test(s) FAILED!\n", failed)

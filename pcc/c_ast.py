@@ -316,6 +316,7 @@ class Decl:
     type: ptr[QualType]
     storage: i8
     body: ptr['Stmt']
+    init: ptr['Expr']            # Var: constant initializer (nullptr if none)
     origin_file: Span            # Source file of the declaration (provenance)
 
 
@@ -406,7 +407,11 @@ def _enumtype_free_raw(p: ptr[EnumType]) -> void:
 
 @compile
 def _decl_alloc_raw() -> ptr[Decl]:
-    return ptr[Decl](effect.mem.malloc(sizeof(Decl)))
+    d: ptr[Decl] = ptr[Decl](effect.mem.malloc(sizeof(Decl)))
+    # init is optional (only Var decls set it); guarantee it is safe to read in
+    # decl_free regardless of which creation site produced the Decl.
+    d.init = nullptr
+    return d
 
 @compile
 def _decl_free_raw(p: ptr[Decl]) -> void:
@@ -778,6 +783,7 @@ def decl_free(prf: DeclProof, d: ptr[Decl]) -> void:
     if d != nullptr:
         _qualtype_free_deep(d.type)
         stmt_free_deep(d.body)
+        expr_free_deep(d.init)
         effect.mem.free(d)
     consume(prf)
 
@@ -990,6 +996,7 @@ class Expr:
     args: ptr['Expr']    # Call argument array (contiguous)
     arg_count: i32
     type_ref: ptr['QualType']  # Operand type for Cast / Sizeof / CompoundLit
+    is_global: i8        # Ident: names a file-scope global (accessor rewrite)
 
 
 # Resolve Expr forward references (ptr['Expr'] -> ptr[Expr])
@@ -1013,6 +1020,7 @@ def expr_alloc() -> ptr[Expr]:
     e.args = nullptr
     e.arg_count = 0
     e.type_ref = nullptr
+    e.is_global = 0
     return e
 
 
@@ -1210,6 +1218,7 @@ class Stmt:
     stmts: ptr['Stmt']     # Block statements array
     stmt_count: i32
     label: Span
+    goto_dir: i8           # Goto: 0 unresolved, 1 forward (goto_end), 2 back (goto)
     decl_type: ptr[QualType]
     decl_name: Span
 
@@ -1238,6 +1247,7 @@ def stmt_alloc() -> ptr[Stmt]:
     s.stmts = nullptr
     s.stmt_count = 0
     s.label = span_empty()
+    s.goto_dir = 0
     s.decl_type = nullptr
     s.decl_name = span_empty()
     return s

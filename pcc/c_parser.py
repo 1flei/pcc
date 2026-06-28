@@ -99,6 +99,12 @@ MAX_ENUM_VALUES = 256
 MAX_ERRORS = 16
 MAX_INIT_LIST_ELEMS = 64
 MAX_TYPEDEFS = 256
+# File-scope object names whose references lower to accessor derefs, plus the
+# in-scope local/param names used to resolve shadowing. Both reset per TU /
+# per function. Over-capacity names simply stay untagged (emit bare -> a loud
+# PythoC NameError, never a silent miscompile).
+MAX_GLOBALS = 2048
+MAX_LOCAL_NAMES = 512
 
 
 @compile
@@ -107,9 +113,10 @@ class Parser:
     lex: ptr[Lexer]
     current: Token               # Current token
     has_token: i8                # Whether current token is valid
-    # Scratch buffers for building AST
-    params: array[ParamInfo, MAX_PARAMS]
-    fields: array[FieldInfo, MAX_FIELDS]
+    # Scratch buffer for building enum value lists. Parameter and struct-field
+    # parsing recurse into themselves, so they use function-local scratch
+    # instead of a Parser-wide buffer (a shared buffer would be clobbered by the
+    # nested call, e.g. a function-pointer parameter).
     enum_vals: array[EnumValue, MAX_ENUM_VALUES]
     # Error tracking
     errors: array[ParseError, MAX_ERRORS]
@@ -117,6 +124,14 @@ class Parser:
     # Typedef name tracking
     typedefs: array[Span, MAX_TYPEDEFS]
     typedef_count: i32
+    # File-scope object names (globals we emit accessors for). References to
+    # these lower to <accessor>()[0]; a shadowing local/param wins instead.
+    globals: array[Span, MAX_GLOBALS]
+    global_count: i32
+    # Lexical local/param names currently in scope (mark/release stack via
+    # local_count). Used to resolve whether an identifier is a global or a local.
+    local_names: array[Span, MAX_LOCAL_NAMES]
+    local_count: i32
     # Origin file of the declaration currently being parsed (provenance)
     origin: Span
 
@@ -352,6 +367,84 @@ def parser_register_typedef(p: ParserRef, name: Span) -> void:
         p.typedef_count = p.typedef_count + 1
 
 
+@compile
+def parser_register_global(p: ParserRef, name: Span) -> void:
+    """Register a file-scope object name whose references lower to an accessor.
+
+    Only non-extern definitions are registered (extern declarations and system
+    globals such as errno keep their bare name; we emit no accessor for them).
+    """
+    if p.global_count < MAX_GLOBALS and not span_is_empty(name):
+        p.globals[p.global_count] = name
+        p.global_count = p.global_count + 1
+
+
+@compile
+def parser_is_global(p: ParserRef, name: Span) -> bool:
+    """Whether name is a registered file-scope global."""
+    i: i32 = 0
+    while i < p.global_count:
+        if span_eq(p.globals[i], name):
+            return True
+        i = i + 1
+    return False
+
+
+@compile
+def parser_scope_enter(p: ParserRef) -> i32:
+    """Open a lexical scope; returns a mark to restore on exit."""
+    return p.local_count
+
+
+@compile
+def parser_scope_leave(p: ParserRef, mark: i32) -> void:
+    """Close a lexical scope, dropping locals declared since `mark`."""
+    p.local_count = mark
+
+
+@compile
+def parser_add_local(p: ParserRef, name: Span) -> void:
+    """Record a local/param name in the current scope."""
+    if p.local_count < MAX_LOCAL_NAMES and not span_is_empty(name):
+        p.local_names[p.local_count] = name
+        p.local_count = p.local_count + 1
+
+
+@compile
+def parser_is_local(p: ParserRef, name: Span) -> bool:
+    """Whether name is an in-scope local/param (shadows any global)."""
+    i: i32 = 0
+    while i < p.local_count:
+        if span_eq(p.local_names[i], name):
+            return True
+        i = i + 1
+    return False
+
+
+@compile
+def parser_ident_is_global_ref(p: ParserRef, name: Span) -> bool:
+    """Resolve an identifier use: a global iff registered and not shadowed."""
+    if parser_is_local(p, name):
+        return False
+    return parser_is_global(p, name)
+
+
+@compile
+def parser_register_params(p: ParserRef, qt: ptr[QualType]) -> void:
+    """Add a function definition's parameter names to the current scope."""
+    if qt == nullptr or qt.type == nullptr:
+        return
+    match qt.type[0]:
+        case (CType.Func, ft):
+            if ft != nullptr:
+                i: i32 = 0
+                while i < ft.param_count:
+                    parser_add_local(p, ft.params[i].name)
+                    i = i + 1
+        case _:
+            pass
+
+
 # =============================================================================
 # Expression Parser (Pratt / precedence climbing)
 # =============================================================================
@@ -522,15 +615,19 @@ def parse_init_list(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Expr], Parse
         if parser_match(p, TokenType.LBRACE):
             elem, prfs = parse_init_list(p, prfs)
         else:
-            # Handle designated initializers: .field = expr or [idx] = expr
-            # For simplicity, skip the designator and parse the value
+            # Designated initializers (.field = expr / [idx] = expr) carry the
+            # target position in the designator, which a positional lowering
+            # would silently drop and misassign. Flag the list (op != 0) so the
+            # backend rejects it loudly rather than miscompiling.
             if parser_match(p, TokenType.DOT):
+                e.op = 1
                 prfs = parser_advance(p, prfs)  # skip '.'
                 if parser_match(p, TokenType.IDENTIFIER):
                     prfs = parser_advance(p, prfs)  # skip field name
                 if parser_match(p, TokenType.ASSIGN):
                     prfs = parser_advance(p, prfs)  # skip '='
             elif parser_match(p, TokenType.LBRACKET):
+                e.op = 1
                 prfs = parser_advance(p, prfs)  # skip '['
                 # skip index expression
                 _idx_expr: ptr[Expr]
@@ -602,6 +699,8 @@ def parse_expr_prefix(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Expr], Par
             e = expr_alloc()
             e.kind = ExprKind(ExprKind.Ident)
             e.span = span_from_token(p.current)
+            if parser_ident_is_global_ref(p, e.span):
+                e.is_global = 1
             prfs = parser_advance(p, prfs)
             return e, prfs
 
@@ -1389,6 +1488,11 @@ def parse_func_params_body(p: ParserRef, prfs: ParserProofs, dr: DeclaratorResul
     param_count_b: i32 = 0
     is_variadic_b: i8 = 0
 
+    # Local scratch so a function-typed parameter (whose own parameter list
+    # recurses back into this parser) does not clobber the outer in-progress
+    # params, mirroring parse_struct_fields.
+    scratch: array[ParamInfo, MAX_PARAMS]
+
     # Empty params: ')'
     if parser_match(p, TokenType.RPAREN):
         prfs = parser_advance(p, prfs)
@@ -1409,8 +1513,8 @@ def parse_func_params_body(p: ParserRef, prfs: ParserProofs, dr: DeclaratorResul
             prfs = parse_declarator_recursive(p, prfs, dr_first_ref)
             first_qt_prf, first_qt = apply_decl_ops(dr_first_ref, first_qt_prf, first_qt)
 
-            p.params[param_count_b].name = dr_first.name
-            p.params[param_count_b].type = first_qt
+            scratch[param_count_b].name = dr_first.name
+            scratch[param_count_b].type = first_qt
             consume(first_qt_prf)
             param_count_b = param_count_b + 1
 
@@ -1438,8 +1542,8 @@ def parse_func_params_body(p: ParserRef, prfs: ParserProofs, dr: DeclaratorResul
                     prfs = parse_declarator_recursive(p, prfs, dr_v_ref)
                     qt_v_prf, qt_v = apply_decl_ops(dr_v_ref, qt_v_prf, qt_v)
 
-                    p.params[param_count_b].name = dr_v.name
-                    p.params[param_count_b].type = qt_v
+                    scratch[param_count_b].name = dr_v.name
+                    scratch[param_count_b].type = qt_v
                     consume(qt_v_prf)
                     param_count_b = param_count_b + 1
 
@@ -1475,8 +1579,8 @@ def parse_func_params_body(p: ParserRef, prfs: ParserProofs, dr: DeclaratorResul
             prfs = parse_declarator_recursive(p, prfs, dr_b_ref)
             qt_b_prf, qt_b = apply_decl_ops(dr_b_ref, qt_b_prf, qt_b)
 
-            p.params[param_count_b].name = dr_b.name
-            p.params[param_count_b].type = qt_b
+            scratch[param_count_b].name = dr_b.name
+            scratch[param_count_b].type = qt_b
             consume(qt_b_prf)
             param_count_b = param_count_b + 1
 
@@ -1496,7 +1600,7 @@ def parse_func_params_body(p: ParserRef, prfs: ParserProofs, dr: DeclaratorResul
     dr.ops[dr.op_count].array_size = 0
     if param_count_b > 0:
         params_heap: ptr[ParamInfo] = paraminfo_alloc(param_count_b)
-        memcpy(params_heap, ptr(p.params[0]), param_count_b * sizeof(ParamInfo))
+        memcpy(params_heap, ptr(scratch[0]), param_count_b * sizeof(ParamInfo))
         dr.ops[dr.op_count].params = params_heap
     else:
         dr.ops[dr.op_count].params = nullptr
@@ -1563,7 +1667,12 @@ def parse_func_params(p: ParserRef, prfs: ParserProofs, param_count: ptr[i32], i
     
     param_count[0] = 0
     is_variadic[0] = 0
-    
+
+    # Local scratch so a function-typed parameter (whose own parameter list
+    # recurses back into this parser) does not clobber the outer in-progress
+    # params, mirroring parse_struct_fields.
+    scratch: array[ParamInfo, MAX_PARAMS]
+
     # Empty params or (void)
     if parser_match(p, TokenType.RPAREN):
         prfs = parser_advance(p, prfs)
@@ -1584,8 +1693,8 @@ def parse_func_params(p: ParserRef, prfs: ParserProofs, param_count: ptr[i32], i
         prfs = parse_declarator_recursive(p, prfs, dr_fp_ref)
         first_qt_prf, first_qt = apply_decl_ops(dr_fp_ref, first_qt_prf, first_qt)
 
-        p.params[0].name = dr_fp.name
-        p.params[0].type = first_qt
+        scratch[0].name = dr_fp.name
+        scratch[0].type = first_qt
         consume(first_qt_prf)
         param_count[0] = 1
 
@@ -1597,7 +1706,7 @@ def parse_func_params(p: ParserRef, prfs: ParserProofs, param_count: ptr[i32], i
             prfs = parser_skip_gcc_extensions(p, prfs)
             if param_count[0] > 0:
                 params_fp: ptr[ParamInfo] = paraminfo_alloc(param_count[0])
-                memcpy(params_fp, ptr(p.params[0]), param_count[0] * sizeof(ParamInfo))
+                memcpy(params_fp, ptr(scratch[0]), param_count[0] * sizeof(ParamInfo))
                 return params_fp, prfs
             return nullptr, prfs
     
@@ -1627,8 +1736,8 @@ def parse_func_params(p: ParserRef, prfs: ParserProofs, param_count: ptr[i32], i
         qt_prf, qt = apply_decl_ops(dr_param_ref, qt_prf, qt)
 
         # Store in scratch buffer
-        p.params[param_count[0]].name = dr_param.name
-        p.params[param_count[0]].type = qt
+        scratch[param_count[0]].name = dr_param.name
+        scratch[param_count[0]].type = qt
         consume(qt_prf)  # Transfer ownership to params array
 
         param_count[0] = param_count[0] + 1
@@ -1647,7 +1756,7 @@ def parse_func_params(p: ParserRef, prfs: ParserProofs, param_count: ptr[i32], i
     # Copy params to heap
     if param_count[0] > 0:
         params: ptr[ParamInfo] = paraminfo_alloc(param_count[0])
-        memcpy(params, ptr(p.params[0]), param_count[0] * sizeof(ParamInfo))
+        memcpy(params, ptr(scratch[0]), param_count[0] * sizeof(ParamInfo))
         return params, prfs
     
     return nullptr, prfs
@@ -1919,6 +2028,10 @@ def parse_local_decl(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], Pars
         ds.decl_name = dr_local.name
         consume(qt_prf)
 
+        # The name is in scope within its own initializer (C semantics), so
+        # register it before parsing the initializer. This shadows any global.
+        parser_add_local(p, dr_local.name)
+
         # Initializer: an assignment-expression, parsed above the comma
         # operator so the declarator-separating comma is not consumed.
         if parser_match(p, TokenType.ASSIGN):
@@ -2024,6 +2137,8 @@ def parse_statement(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], Parse
             s = stmt_alloc()
             s.kind = StmtKind(StmtKind.For)
             prfs = parser_advance(p, prfs)
+            # The init declaration scopes to the whole loop (cond/incr/body).
+            for_mark: i32 = parser_scope_enter(p)
             _, prfs = parser_expect(p, prfs, TokenType.LPAREN)
             # Init - check for declaration (e.g. for (int i = 0; ...))
             if not parser_match(p, TokenType.SEMICOLON):
@@ -2042,6 +2157,7 @@ def parse_statement(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], Parse
                     s.decl_type = qt_for
                     s.decl_name = dr_for.name
                     consume(qt_for_prf)
+                    parser_add_local(p, dr_for.name)
                     # Optional initializer
                     if parser_match(p, TokenType.ASSIGN):
                         prfs = parser_advance(p, prfs)
@@ -2058,6 +2174,7 @@ def parse_statement(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], Parse
                 s.incr_expr, prfs = parse_expression(p, prfs)
             _, prfs = parser_expect(p, prfs, TokenType.RPAREN)
             s.body, prfs = parse_statement(p, prfs)
+            parser_scope_leave(p, for_mark)
             return s, prfs
 
         # Break
@@ -2159,6 +2276,10 @@ def parse_block(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], ParserPro
     if not ok:
         return s, prfs
 
+    # A C block opens a lexical scope: locals declared here shadow outer names
+    # (including globals) only until the matching '}'.
+    bmark: i32 = parser_scope_enter(p)
+
     # Parse statements into scratch (using a simple array)
     scratch: array[Stmt, MAX_BLOCK_STMTS]
     count: i32 = 0
@@ -2182,6 +2303,7 @@ def parse_block(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], ParserPro
             count = count + 1
 
     _, prfs = parser_expect(p, prfs, TokenType.RBRACE)
+    parser_scope_leave(p, bmark)
 
     if count > 0:
         s.stmts = stmt_alloc_array(count)
@@ -2214,10 +2336,14 @@ def make_func_decl_with_body(p: ParserRef, prfs: ParserProofs, qt_prf: QualTypeP
     # Skip GCC extensions before function body
     prfs = parser_skip_gcc_extensions(p, prfs)
 
-    # Parse function body if present
+    # Parse function body if present. Parameter names live in a function-level
+    # scope so references inside the body resolve to params, not globals.
     match p.current.type:
         case TokenType.LBRACE:
+            fmark: i32 = parser_scope_enter(p)
+            parser_register_params(p, decl.type)
             decl.body, prfs = parse_block(p, prfs)
+            parser_scope_leave(p, fmark)
         case TokenType.SEMICOLON:
             prfs = parser_advance(p, prfs)
         case _:
@@ -2444,10 +2570,19 @@ def parse_regular_decl(p: ParserRef, prfs: ParserProofs, storage: i8) -> struct[
         decl.storage = storage
         decl.body = nullptr
         _decl_set_origin(p, decl)
+        # A non-extern file-scope object is one we emit an accessor for, so its
+        # later references must lower to <accessor>()[0]. extern declarations
+        # and system globals keep their bare name.
+        if storage != STORAGE_EXTERN:
+            parser_register_global(p, name)
         consume(qt_prf)
-        # Skip initializer if present
+        # Capture the initializer so the accessor can seed its static storage.
         if parser_match(p, TokenType.ASSIGN):
-            prfs = parser_skip_until_semicolon(p, prfs)
+            prfs = parser_advance(p, prfs)
+            if parser_match(p, TokenType.LBRACE):
+                decl.init, prfs = parse_init_list(p, prfs)
+            else:
+                decl.init, prfs = parse_expr_bp(p, prfs, _INIT_BP)
         if parser_match(p, TokenType.SEMICOLON):
             prfs = parser_advance(p, prfs)
         return 1, decl_prf, decl, prfs
@@ -2488,6 +2623,8 @@ def parse_declarations(source: ptr[i8]) -> struct[DeclProof, ptr[Decl]]:
         parser.has_token = 0
         parser.error_count = 0
         parser.typedef_count = 0
+        parser.global_count = 0
+        parser.local_count = 0
 
         # Create proofs struct (linear fields passed separately)
         # current_prf is dummy initially - will be set by first parser_advance
@@ -2679,9 +2816,21 @@ def parse_declarations(source: ptr[i8]) -> struct[DeclProof, ptr[Decl]]:
                                 decl.storage = storage
                                 decl.body = nullptr
                                 _decl_set_origin(p, decl)
+                                # A non-extern struct-typed object gets an
+                                # accessor like any other global, so its later
+                                # references must lower to <accessor>()[0].
+                                if storage != STORAGE_EXTERN:
+                                    parser_register_global(p, dr_st.name)
                                 consume(qt_prf)
+                                # Capture the initializer so the accessor can
+                                # seed its static storage (constant aggregate);
+                                # dropping it would silently zero the object.
                                 if parser_match(p, TokenType.ASSIGN):
-                                    prfs = parser_skip_until_semicolon(p, prfs)
+                                    prfs = parser_advance(p, prfs)
+                                    if parser_match(p, TokenType.LBRACE):
+                                        decl.init, prfs = parse_init_list(p, prfs)
+                                    else:
+                                        decl.init, prfs = parse_expr_bp(p, prfs, _INIT_BP)
                                 if parser_match(p, TokenType.SEMICOLON):
                                     prfs = parser_advance(p, prfs)
                                 yield decl_prf, decl
@@ -2734,9 +2883,18 @@ def parse_declarations(source: ptr[i8]) -> struct[DeclProof, ptr[Decl]]:
                                 decl.storage = storage
                                 decl.body = nullptr
                                 _decl_set_origin(p, decl)
+                                if storage != STORAGE_EXTERN:
+                                    parser_register_global(p, dr_un.name)
                                 consume(qt_prf)
+                                # Capture the initializer so the accessor can
+                                # seed its static storage (constant aggregate);
+                                # dropping it would silently zero the object.
                                 if parser_match(p, TokenType.ASSIGN):
-                                    prfs = parser_skip_until_semicolon(p, prfs)
+                                    prfs = parser_advance(p, prfs)
+                                    if parser_match(p, TokenType.LBRACE):
+                                        decl.init, prfs = parse_init_list(p, prfs)
+                                    else:
+                                        decl.init, prfs = parse_expr_bp(p, prfs, _INIT_BP)
                                 if parser_match(p, TokenType.SEMICOLON):
                                     prfs = parser_advance(p, prfs)
                                 yield decl_prf, decl
@@ -2791,9 +2949,18 @@ def parse_declarations(source: ptr[i8]) -> struct[DeclProof, ptr[Decl]]:
                                 decl.storage = storage
                                 decl.body = nullptr
                                 _decl_set_origin(p, decl)
+                                if storage != STORAGE_EXTERN:
+                                    parser_register_global(p, dr_en.name)
                                 consume(qt_prf)
+                                # Capture the initializer so the accessor can
+                                # seed its static storage (constant aggregate);
+                                # dropping it would silently zero the object.
                                 if parser_match(p, TokenType.ASSIGN):
-                                    prfs = parser_skip_until_semicolon(p, prfs)
+                                    prfs = parser_advance(p, prfs)
+                                    if parser_match(p, TokenType.LBRACE):
+                                        decl.init, prfs = parse_init_list(p, prfs)
+                                    else:
+                                        decl.init, prfs = parse_expr_bp(p, prfs, _INIT_BP)
                                 if parser_match(p, TokenType.SEMICOLON):
                                     prfs = parser_advance(p, prfs)
                                 yield decl_prf, decl

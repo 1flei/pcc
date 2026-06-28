@@ -43,6 +43,7 @@ from pythoc import (
 )
 from pythoc.std import mem  # noqa: F401  (sets up default mem effect)
 from pythoc.std.vector import Vector
+from pythoc.libc.stdio import printf, fflush
 
 from .c_token import TokenType
 from .c_ast import (
@@ -54,7 +55,7 @@ from .c_ast import (
     DeclRef, decl_nonnull, decl_free,
     QUAL_NONE, QUAL_CONST, QUAL_VOLATILE,
     STORAGE_NONE, STORAGE_EXTERN, STORAGE_STATIC, STORAGE_INLINE,
-    ExprKind, Expr,
+    ExprKind, Expr, expr_eval_const,
     StmtKind, Stmt,
 )
 
@@ -102,6 +103,221 @@ def strbuf_push_span(buf: ptr[StringBuffer], s: Span) -> void:
 
 
 @compile
+def strbuf_push_string_span(buf: ptr[StringBuffer], s: Span) -> void:
+    """Append a Span that represents one or more C string literals.
+
+    Adjacent C string literals may be separated by whitespace, comments, or
+    preprocessor line markers.  Their contents are concatenated and emitted as
+    one Python string literal; this keeps PythoC static initializers as single
+    compile-time constants.
+    """
+    strbuf_push_char(buf, char('"'))
+    i: i32 = 0
+    while i < s.len:
+        # Skip separators between adjacent C literals (whitespace, comments,
+        # preprocessor line markers).
+        while i < s.len and s.start[i] != char('"'):
+            if s.start[i] == char('#'):
+                # Skip preprocessor line marker to end of line.
+                while i < s.len and s.start[i] != char('\n'):
+                    i = i + 1
+            i = i + 1
+        if i >= s.len:
+            break
+        # Found an opening quote; copy the literal contents until the matching
+        # closing quote, preserving C escape sequences (they are valid Python
+        # escapes as well).
+        i = i + 1
+        while i < s.len:
+            c: i8 = s.start[i]
+            if c == char('\\'):
+                # Copy the escape sequence as-is so Python decodes it the same
+                # way the C compiler would.
+                strbuf_push_char(buf, c)
+                i = i + 1
+                if i < s.len:
+                    strbuf_push_char(buf, s.start[i])
+                    i = i + 1
+            elif c == char('"'):
+                # Closing quote of this literal; adjacent literal handled next.
+                i = i + 1
+                break
+            else:
+                strbuf_push_char(buf, c)
+                i = i + 1
+    strbuf_push_char(buf, char('"'))
+
+
+@compile
+def _span_eq_cstr_prefix(s: Span, cstr: ptr[i8], len_cstr: i32) -> bool:
+    """Whether span content equals the given null-terminated ASCII string."""
+    if s.len != len_cstr:
+        return False
+    i: i32 = 0
+    while i < s.len:
+        if s.start[i] != cstr[i]:
+            return False
+        i = i + 1
+    return cstr[i] == 0
+
+
+@compile
+def _is_python_keyword(name: Span) -> i8:
+    """Whether ``name`` is a Python keyword and therefore invalid as an identifier."""
+    if name.len == 2:
+        if _span_eq_cstr_prefix(name, "as", 2): return 1
+        if _span_eq_cstr_prefix(name, "if", 2): return 1
+        if _span_eq_cstr_prefix(name, "in", 2): return 1
+        if _span_eq_cstr_prefix(name, "is", 2): return 1
+        if _span_eq_cstr_prefix(name, "or", 2): return 1
+    elif name.len == 3:
+        if _span_eq_cstr_prefix(name, "and", 3): return 1
+        if _span_eq_cstr_prefix(name, "def", 3): return 1
+        if _span_eq_cstr_prefix(name, "del", 3): return 1
+        if _span_eq_cstr_prefix(name, "for", 3): return 1
+        if _span_eq_cstr_prefix(name, "not", 3): return 1
+        if _span_eq_cstr_prefix(name, "try", 3): return 1
+    elif name.len == 4:
+        if _span_eq_cstr_prefix(name, "True", 4): return 1
+        if _span_eq_cstr_prefix(name, "None", 4): return 1
+        if _span_eq_cstr_prefix(name, "from", 4): return 1
+        if _span_eq_cstr_prefix(name, "pass", 4): return 1
+        if _span_eq_cstr_prefix(name, "else", 4): return 1
+        if _span_eq_cstr_prefix(name, "elif", 4): return 1
+        if _span_eq_cstr_prefix(name, "with", 4): return 1
+    elif name.len == 5:
+        if _span_eq_cstr_prefix(name, "False", 5): return 1
+        if _span_eq_cstr_prefix(name, "async", 5): return 1
+        if _span_eq_cstr_prefix(name, "await", 5): return 1
+        if _span_eq_cstr_prefix(name, "break", 5): return 1
+        if _span_eq_cstr_prefix(name, "class", 5): return 1
+        if _span_eq_cstr_prefix(name, "while", 5): return 1
+        if _span_eq_cstr_prefix(name, "yield", 5): return 1
+        if _span_eq_cstr_prefix(name, "raise", 5): return 1
+    elif name.len == 6:
+        if _span_eq_cstr_prefix(name, "assert", 6): return 1
+        if _span_eq_cstr_prefix(name, "except", 6): return 1
+        if _span_eq_cstr_prefix(name, "global", 6): return 1
+        if _span_eq_cstr_prefix(name, "import", 6): return 1
+        if _span_eq_cstr_prefix(name, "lambda", 6): return 1
+        if _span_eq_cstr_prefix(name, "return", 6): return 1
+    elif name.len == 7:
+        if _span_eq_cstr_prefix(name, "finally", 7): return 1
+    elif name.len == 8:
+        if _span_eq_cstr_prefix(name, "continue", 8): return 1
+        if _span_eq_cstr_prefix(name, "nonlocal", 8): return 1
+    return 0
+
+
+@compile
+def _span_eq_cstr(name: Span, cstr: ptr[i8]) -> i8:
+    """Exact equality between a Span and a NUL-terminated ASCII string."""
+    i: i32 = 0
+    while i < name.len:
+        if cstr[i] == 0:
+            return 0
+        if name.start[i] != cstr[i]:
+            return 0
+        i = i + 1
+    if cstr[i] != 0:
+        return 0
+    return 1
+
+
+@compile
+def _is_stdstream_name(name: Span) -> i8:
+    """Return non-zero for macOS stdio globals that are accessor functions."""
+    if name.len == 10:
+        if _span_eq_cstr(name, "__stdoutp") != 0: return 1
+        if _span_eq_cstr(name, "__stderrp") != 0: return 1
+        if _span_eq_cstr(name, "__stdinp") != 0: return 1
+    return 0
+
+
+@compile
+def _is_nullability_attr(name: Span) -> i8:
+    """Return non-zero for Apple/nullability attributes that appear where a
+    parameter name would otherwise be (e.g. `void * _Nullable`)."""
+    if name.len == 9:
+        if _span_eq_cstr(name, "_Nullable") != 0: return 1
+    if name.len == 8:
+        if _span_eq_cstr(name, "_Nonnull") != 0: return 1
+    if name.len == 17:
+        if _span_eq_cstr(name, "_Null_unspecified") != 0: return 1
+    return 0
+
+
+@compile
+def _is_opaque_struct_tag(name: Span) -> i8:
+    """Return non-zero for struct/union tags that are only forward-declared."""
+    if name.len == 8:
+        if _span_eq_cstr(name, "_tccdbg") != 0: return 1
+    if name.len == 10:
+        if _span_eq_cstr(name, "rt_context") != 0: return 1
+    return 0
+
+
+@compile
+def emit_identifier(buf: ptr[StringBuffer], name: Span) -> void:
+    """Emit a C identifier as a Python identifier.
+
+    If the C name is a Python keyword, emit it with a trailing ``_`` so the
+    generated source remains syntactically valid.  This keeps every reference
+    consistent because the backend always emits a given name through this path.
+    """
+    strbuf_push_span(buf, name)
+    if _is_python_keyword(name) != 0:
+        strbuf_push_char(buf, char("_"))
+
+
+@compile
+def _map_std_typedef_name(name: Span) -> ptr[i8]:
+    """Map common C stdint/sys/types typedef names to PythoC built-in types.
+
+    These typedefs originate in system headers that pcc does not emit as
+    separate modules, so referencing them by their raw name would be a NameError.
+    Redirecting to the built-in type keeps generated modules self-contained.
+    """
+    if _span_eq_cstr_prefix(name, "int8_t", 6):
+        return "i8"
+    if _span_eq_cstr_prefix(name, "uint8_t", 7):
+        return "u8"
+    if _span_eq_cstr_prefix(name, "int16_t", 7):
+        return "i16"
+    if _span_eq_cstr_prefix(name, "uint16_t", 8):
+        return "u16"
+    if _span_eq_cstr_prefix(name, "int32_t", 7):
+        return "i32"
+    if _span_eq_cstr_prefix(name, "uint32_t", 8):
+        return "u32"
+    if _span_eq_cstr_prefix(name, "int64_t", 7):
+        return "i64"
+    if _span_eq_cstr_prefix(name, "uint64_t", 8):
+        return "u64"
+    if _span_eq_cstr_prefix(name, "size_t", 6):
+        return "u64"
+    if _span_eq_cstr_prefix(name, "ssize_t", 7):
+        return "i64"
+    if _span_eq_cstr_prefix(name, "uintptr_t", 9):
+        return "u64"
+    if _span_eq_cstr_prefix(name, "intptr_t", 8):
+        return "i64"
+    if _span_eq_cstr_prefix(name, "ptrdiff_t", 9):
+        return "i64"
+    if _span_eq_cstr_prefix(name, "va_list", 7):
+        return "ptr[i8]"
+    if _span_eq_cstr_prefix(name, "FILE", 4):
+        return "void"
+    if _span_eq_cstr_prefix(name, "jmp_buf", 7):
+        return "array[i8, 256]"
+    if _span_eq_cstr_prefix(name, "idtype_t", 8):
+        return "i32"
+    if _span_eq_cstr_prefix(name, "id_t", 4):
+        return "i32"
+    return nullptr
+
+
+@compile
 def strbuf_push_i32(buf: ptr[StringBuffer], val: i32) -> void:
     """Append an i32 as decimal string"""
     if val < 0:
@@ -125,7 +341,11 @@ def strbuf_push_i32(buf: ptr[StringBuffer], val: i32) -> void:
 
 @compile
 def strbuf_push_i64(buf: ptr[StringBuffer], val: i64) -> void:
-    """Append an i64 as decimal string"""
+    """Append an i64 as decimal string."""
+    if val == -9223372036854775808:
+        # Negating LLONG_MIN overflows; emit the literal directly.
+        strbuf_push_cstr(buf, "-9223372036854775808")
+        return
     if val < 0:
         _strbuf_push_back(buf, 45)  # '-'
         val = -val
@@ -200,9 +420,11 @@ def emit_anon_aggregate(buf: ptr[StringBuffer], st: ptr[StructType], is_union: i
             field: ptr[FieldInfo] = ptr(st.fields[i])
             # Field names are quoted: struct["name": T] uses Python slice syntax
             # whose key must be a string literal, not an evaluated identifier.
+            # Keyword field names are mangled so the quoted key matches the
+            # identifier used for member access.
             strbuf_push_char(buf, 34)  # '"'
             if not span_is_empty(field.name):
-                strbuf_push_span(buf, field.name)
+                emit_identifier(buf, field.name)
             else:
                 strbuf_push_cstr(buf, "_field")
                 strbuf_push_i32(buf, i)
@@ -220,20 +442,46 @@ def emit_pointee(buf: ptr[StringBuffer], qt: ptr[QualType]) -> void:
     Named struct/union pointees are emitted as a quoted forward reference
     (e.g. ptr["Tag"]) so self-referential and mutually-recursive aggregates
     resolve lazily instead of requiring the name to already be bound.
+
+    Typedef pointees use the same quoted form: a typedef may name an
+    incomplete struct (e.g. ``typedef struct TCCState TCCState;``) that is
+    only defined later in the same module.
     """
     if qt != nullptr and qt.type != nullptr:
         match qt.type[0]:
             case (CType.Struct, st):
                 if st != nullptr and not span_is_empty(st.name):
-                    strbuf_push_char(buf, 34)  # '"'
-                    strbuf_push_span(buf, st.name)
-                    strbuf_push_char(buf, 34)
+                    if st.is_complete == 0 and _is_opaque_struct_tag(st.name) != 0:
+                        # Truly opaque forward declaration (never completed in the
+                        # project); downgrade to void* so linking can proceed.
+                        strbuf_push_cstr(buf, "void")
+                    else:
+                        # Quoted forward reference: the tag is defined later in the
+                        # same module or is imported from another generated module.
+                        strbuf_push_char(buf, 34)  # '"'
+                        emit_identifier(buf, st.name)
+                        strbuf_push_char(buf, 34)
                     return
             case (CType.Union, st):
                 if st != nullptr and not span_is_empty(st.name):
-                    strbuf_push_char(buf, 34)
-                    strbuf_push_span(buf, st.name)
-                    strbuf_push_char(buf, 34)
+                    if st.is_complete == 0 and _is_opaque_struct_tag(st.name) != 0:
+                        strbuf_push_cstr(buf, "void")
+                    else:
+                        strbuf_push_char(buf, 34)
+                        emit_identifier(buf, st.name)
+                        strbuf_push_char(buf, 34)
+                    return
+            case (CType.Typedef, name):
+                if not span_is_empty(name):
+                    mapped: ptr[i8] = _map_std_typedef_name(name)
+                    if mapped != nullptr:
+                        # Mapped to a PythoC built-in type; emit it directly so
+                        # primitives like u8 do not become unresolved forward refs.
+                        strbuf_push_cstr(buf, mapped)
+                    else:
+                        strbuf_push_char(buf, 34)  # '"'
+                        emit_identifier(buf, name)
+                        strbuf_push_char(buf, 34)
                     return
             case _:
                 pass
@@ -344,28 +592,32 @@ def emit_ctype(buf: ptr[StringBuffer], ty: ptr[CType]) -> void:
         # Struct type
         case (CType.Struct, st):
             if st != nullptr and not span_is_empty(st.name):
-                strbuf_push_span(buf, st.name)
+                emit_identifier(buf, st.name)
             else:
                 emit_anon_aggregate(buf, st, 0)
-        
+
         # Union type
         case (CType.Union, st):
             if st != nullptr and not span_is_empty(st.name):
-                strbuf_push_span(buf, st.name)
+                emit_identifier(buf, st.name)
             else:
                 emit_anon_aggregate(buf, st, 1)
-        
+
         # Enum type
         case (CType.Enum, et):
             if et != nullptr and not span_is_empty(et.name):
-                strbuf_push_span(buf, et.name)
+                emit_identifier(buf, et.name)
             else:
                 strbuf_push_cstr(buf, "i32")
-        
+
         # Typedef reference
         case (CType.Typedef, name):
             if not span_is_empty(name):
-                strbuf_push_span(buf, name)
+                mapped: ptr[i8] = _map_std_typedef_name(name)
+                if mapped != nullptr:
+                    strbuf_push_cstr(buf, mapped)
+                else:
+                    emit_identifier(buf, name)
             else:
                 strbuf_push_cstr(buf, "i32")
         
@@ -496,12 +748,19 @@ def emit_expr(buf: ptr[StringBuffer], e: ptr[Expr]) -> void:
         case ExprKind.CharLit:
             strbuf_push_i64(buf, e.int_val)
         case ExprKind.StringLit:
-            strbuf_push_span(buf, e.span)
+            strbuf_push_string_span(buf, e.span)
         case ExprKind.Ident:
             if e.is_global != 0:
                 emit_global_ref(buf, e.span)
+            elif _is_stdstream_name(e.span) != 0:
+                # macOS exposes stdin/stdout/stderr as global FILE* variables.
+                # The preprocessor turns references to `stdout` etc. into the
+                # accessor names __stdoutp/__stderrp/__stdinp; those are provided
+                # by pythoc.libc.stdio as @extern functions, so emit a call.
+                emit_identifier(buf, e.span)
+                strbuf_push_cstr(buf, "()")
             else:
-                strbuf_push_span(buf, e.span)
+                emit_identifier(buf, e.span)
         case ExprKind.UnaryOp:
             emit_unary(buf, e)
         case ExprKind.PostfixOp:
@@ -536,21 +795,76 @@ def emit_expr(buf: ptr[StringBuffer], e: ptr[Expr]) -> void:
             emit_expr(buf, e.lhs)
         case ExprKind.Ternary:
             strbuf_push_char(buf, 40)  # '('
-            emit_expr(buf, e.rhs)      # value-if-true
+            emit_ternary_branch(buf, e.rhs)      # value-if-true
             strbuf_push_cstr(buf, " if ")
             emit_expr(buf, e.lhs)      # condition
             strbuf_push_cstr(buf, " else ")
-            emit_expr(buf, e.extra)    # value-if-false
+            emit_ternary_branch(buf, e.extra)    # value-if-false
             strbuf_push_char(buf, 41)  # ')'
         case ExprKind.Call:
+            if e.lhs != nullptr and e.lhs.kind[0] == ExprKind.Ident:
+                if _span_eq_cstr(e.lhs.span, "__builtin___strcpy_chk") != 0:
+                    # Fortified strcpy: ignore the object-size argument.
+                    strbuf_push_cstr(buf, "strcpy(")
+                    emit_expr(buf, ptr(e.args[0]))
+                    strbuf_push_cstr(buf, ", ")
+                    emit_expr(buf, ptr(e.args[1]))
+                    strbuf_push_char(buf, 41)  # ')'
+                    return
+                if _span_eq_cstr(e.lhs.span, "__builtin___memcpy_chk") != 0:
+                    # Fortified memcpy: ignore the object-size argument.
+                    strbuf_push_cstr(buf, "memcpy(")
+                    emit_expr(buf, ptr(e.args[0]))
+                    strbuf_push_cstr(buf, ", ")
+                    emit_expr(buf, ptr(e.args[1]))
+                    strbuf_push_cstr(buf, ", ")
+                    emit_expr(buf, ptr(e.args[2]))
+                    strbuf_push_char(buf, 41)  # ')'
+                    return
+                if _span_eq_cstr(e.lhs.span, "__builtin___sprintf_chk") != 0:
+                    # Fortified sprintf: args are (buf, flag, bufsize, fmt, ...);
+                    # drop the fortified bookkeeping and emit a normal sprintf.
+                    strbuf_push_cstr(buf, "sprintf(")
+                    emit_expr(buf, ptr(e.args[0]))
+                    strbuf_push_cstr(buf, ", ")
+                    emit_expr(buf, ptr(e.args[3]))
+                    chk_i: i32 = 4
+                    while chk_i < e.arg_count:
+                        strbuf_push_cstr(buf, ", ")
+                        emit_expr(buf, ptr(e.args[chk_i]))
+                        chk_i = chk_i + 1
+                    strbuf_push_char(buf, 41)  # ')'
+                    return
+                if _span_eq_cstr(e.lhs.span, "__builtin_object_size") != 0:
+                    # PythoC cannot compute the runtime object size; return 0.
+                    strbuf_push_cstr(buf, "0")
+                    return
+                if _span_eq_cstr(e.lhs.span, "tcc_add_symbol") != 0:
+                    # ``tcc_add_symbol`` takes a ``void *`` value that may be a
+                    # function pointer in tinycc; cast the third argument to
+                    # ``ptr[void]`` so PythoC does not reject the call.
+                    strbuf_push_cstr(buf, "tcc_add_symbol(")
+                    tcc_i: i32 = 0
+                    while tcc_i < e.arg_count:
+                        if tcc_i > 0:
+                            strbuf_push_cstr(buf, ", ")
+                        if tcc_i == 2:
+                            strbuf_push_cstr(buf, "ptr[void](")
+                            emit_expr(buf, ptr(e.args[tcc_i]))
+                            strbuf_push_char(buf, 41)  # ')'
+                        else:
+                            emit_expr(buf, ptr(e.args[tcc_i]))
+                        tcc_i = tcc_i + 1
+                    strbuf_push_char(buf, 41)  # ')'
+                    return
             emit_expr(buf, e.lhs)
             strbuf_push_char(buf, 40)  # '('
-            i: i32 = 0
-            while i < e.arg_count:
-                if i > 0:
+            arg_i: i32 = 0
+            while arg_i < e.arg_count:
+                if arg_i > 0:
                     strbuf_push_cstr(buf, ", ")
-                emit_expr(buf, ptr(e.args[i]))
-                i = i + 1
+                emit_expr(buf, ptr(e.args[arg_i]))
+                arg_i = arg_i + 1
             strbuf_push_char(buf, 41)  # ')'
         case ExprKind.Index:
             emit_expr(buf, e.lhs)
@@ -560,12 +874,12 @@ def emit_expr(buf: ptr[StringBuffer], e: ptr[Expr]) -> void:
         case ExprKind.Member:
             emit_expr(buf, e.lhs)
             strbuf_push_char(buf, 46)  # '.'
-            strbuf_push_span(buf, e.span)
+            emit_identifier(buf, e.span)
         case ExprKind.Arrow:
             # PythoC uses '.' for pointer member access too.
             emit_expr(buf, e.lhs)
             strbuf_push_char(buf, 46)  # '.'
-            strbuf_push_span(buf, e.span)
+            emit_identifier(buf, e.span)
         case ExprKind.InitList:
             # Designated initializers (.field=/[idx]=) carry a target position
             # the positional tuple lowering cannot represent; reject loudly
@@ -585,10 +899,36 @@ def emit_expr(buf: ptr[StringBuffer], e: ptr[Expr]) -> void:
                 strbuf_push_char(buf, 44)  # ',' single-element tuple
             strbuf_push_char(buf, 41)  # ')'
         case ExprKind.Comma:
-            # Comma operator only handled at statement level.
-            emit_unsupported(buf)
+            # Residual of `a, b` is `b`; side effects of `a` are hoisted by
+            # emit_pre_effects before this residual is read.
+            emit_expr(buf, e.rhs)
         case _:
             emit_unsupported(buf)
+
+
+@compile
+def _expr_is_string_lit(e: ptr[Expr]) -> i32:
+    """Return non-zero if the expression is a string literal."""
+    if e == nullptr:
+        return 0
+    if e.kind[0] == ExprKind.StringLit:
+        return 1
+    return 0
+
+
+@compile
+def emit_ternary_branch(buf: ptr[StringBuffer], e: ptr[Expr]) -> void:
+    """Emit one branch of a ternary expression.
+
+    String literals used as C pointer values inside a conditional can confuse
+    PythoC's value-kind inference, so they are explicitly cast to ptr[i8].
+    """
+    if _expr_is_string_lit(e) != 0:
+        strbuf_push_cstr(buf, "ptr[i8](")
+        strbuf_push_string_span(buf, e.span)
+        strbuf_push_char(buf, 41)  # ')'
+    else:
+        emit_expr(buf, e)
 
 
 # =============================================================================
@@ -679,6 +1019,8 @@ def expr_has_side_effects(e: ptr[Expr]) -> bool:
                     return True
                 j = j + 1
             return False
+        case ExprKind.Comma:
+            return expr_has_side_effects(e.lhs) or expr_has_side_effects(e.rhs)
         case _:
             return False
 
@@ -731,6 +1073,10 @@ def expr_has_post_effect(e: ptr[Expr]) -> bool:
                     return True
                 j = j + 1
             return False
+        case ExprKind.Comma:
+            # lhs post-effects are flushed immediately in emit_pre_effects,
+            # so only rhs post-effects are left deferred.
+            return expr_has_post_effect(e.rhs)
         case _:
             return False
 
@@ -814,6 +1160,13 @@ def emit_pre_effects(buf: ptr[StringBuffer], e: ptr[Expr], indent: i32) -> void:
             while j < e.arg_count:
                 emit_pre_effects(buf, ptr(e.args[j]), indent)
                 j = j + 1
+        case ExprKind.Comma:
+            # C evaluates lhs for side effects and discards its value. Always
+            # emit lhs as a statement so that even "pure" calls (e.g. a macro
+            # like TCC_SET_STATE that expands to (enter_state(), fn)) are
+            # evaluated; harmless pure expressions become no-ops.
+            emit_expr_stmt(buf, e.lhs, indent)
+            emit_pre_effects(buf, e.rhs, indent)
         case _:
             pass
 
@@ -862,6 +1215,10 @@ def emit_post_effects(buf: ptr[StringBuffer], e: ptr[Expr], indent: i32) -> void
             while j < e.arg_count:
                 emit_post_effects(buf, ptr(e.args[j]), indent)
                 j = j + 1
+        case ExprKind.Comma:
+            # lhs post-effects were flushed when it was emitted as a statement
+            # in emit_pre_effects; only rhs post-effects remain deferred.
+            emit_post_effects(buf, e.rhs, indent)
         case _:
             pass
 
@@ -869,10 +1226,23 @@ def emit_post_effects(buf: ptr[StringBuffer], e: ptr[Expr], indent: i32) -> void
 @compile
 def emit_cond(buf: ptr[StringBuffer], e: ptr[Expr], indent: i32) -> void:
     """Emit the residual of a condition expression, after emit_pre_effects has
-    hoisted its side effects. A leftover postfix update cannot be represented
-    here without a temporary, so flag it loudly instead of miscompiling."""
+    hoisted its side effects.
+
+    A leftover postfix ++/-- must run after the condition value is read.  We
+    capture the old value in a temporary variable, emit the postfix updates as
+    separate statements, and then read the temporary as the condition result.
+    The temporary assignment and updates are emitted at ``indent`` so callers
+    that embed the condition in a control-flow header still see valid Python.
+    """
     if expr_has_post_effect(e):
-        emit_unsupported(buf)
+        strbuf_push_indent(buf, indent)
+        strbuf_push_cstr(buf, "__pcc_cond = (")
+        emit_expr(buf, e)
+        strbuf_push_cstr(buf, ")")
+        strbuf_push_newline(buf)
+        emit_post_effects(buf, e, indent)
+        strbuf_push_indent(buf, indent)
+        strbuf_push_cstr(buf, "__pcc_cond")
         return
     emit_expr(buf, e)
 
@@ -939,7 +1309,7 @@ def emit_local_decl(buf: ptr[StringBuffer], s: ptr[Stmt], indent: i32) -> void:
     if s.expr != nullptr:
         emit_pre_effects(buf, s.expr, indent)
     strbuf_push_indent(buf, indent)
-    strbuf_push_span(buf, s.decl_name)
+    emit_identifier(buf, s.decl_name)
     strbuf_push_cstr(buf, ": ")
     emit_qualtype(buf, s.decl_type)
     if s.expr != nullptr:
@@ -994,7 +1364,7 @@ def emit_for(buf: ptr[StringBuffer], s: ptr[Stmt], indent: i32) -> void:
         if s.init_expr != nullptr:
             emit_pre_effects(buf, s.init_expr, indent)
         strbuf_push_indent(buf, indent)
-        strbuf_push_span(buf, s.decl_name)
+        emit_identifier(buf, s.decl_name)
         strbuf_push_cstr(buf, ": ")
         emit_qualtype(buf, s.decl_type)
         if s.init_expr != nullptr:
@@ -1037,12 +1407,51 @@ def emit_for(buf: ptr[StringBuffer], s: ptr[Stmt], indent: i32) -> void:
 
 
 @compile
+def _emit_case_body(buf: ptr[StringBuffer], stmts: ptr[Stmt], n: i32,
+                    start: i32, indent: i32) -> i32:
+    """Emit the statements belonging to one case, return index after break."""
+    wrote_any: bool = False
+    i: i32 = start
+    if i < n:
+        cur: ptr[Stmt] = ptr(stmts[i])
+        if cur.body != nullptr:
+            emit_stmt(buf, cur.body, indent)
+            wrote_any = True
+    i = i + 1
+    while i < n:
+        nxt: ptr[Stmt] = ptr(stmts[i])
+        done: bool = False
+        match nxt.kind[0]:
+            case StmtKind.Case:
+                done = True
+            case StmtKind.Default:
+                done = True
+            case StmtKind.Break:
+                i = i + 1
+                done = True
+            case _:
+                emit_stmt(buf, nxt, indent)
+                wrote_any = True
+                i = i + 1
+        if done:
+            break
+    if not wrote_any:
+        strbuf_push_indent(buf, indent)
+        strbuf_push_cstr(buf, "pass")
+        strbuf_push_newline(buf)
+    return i
+
+
+@compile
 def emit_switch(buf: ptr[StringBuffer], s: ptr[Stmt], indent: i32) -> void:
     """Lower C `switch` to PythoC `match`/`case`.
 
     The parser leaves a flat block of Case/Default markers interleaved with the
     statements that follow each label and the terminating `break`. We regroup
     those into `match` cases, dropping the `break` delimiters.
+
+    Python requires the wildcard ``case _`` to be last, so a C ``default`` label
+    that appears earlier is deferred to the end of the match.
     """
     emit_pre_effects(buf, s.expr, indent)
     strbuf_push_indent(buf, indent)
@@ -1067,57 +1476,30 @@ def emit_switch(buf: ptr[StringBuffer], s: ptr[Stmt], indent: i32) -> void:
         strbuf_push_newline(buf)
         return
 
+    default_idx: i32 = -1
     i: i32 = 0
     while i < n:
         cur: ptr[Stmt] = ptr(stmts[i])
-        is_label: bool = False
         match cur.kind[0]:
             case StmtKind.Case:
                 strbuf_push_indent(buf, indent + 1)
                 strbuf_push_cstr(buf, "case ")
-                emit_expr(buf, cur.expr)
+                strbuf_push_i64(buf, expr_eval_const(cur.expr))
                 strbuf_push_cstr(buf, ":")
                 strbuf_push_newline(buf)
-                is_label = True
+                i = _emit_case_body(buf, stmts, n, i, indent + 2)
             case StmtKind.Default:
-                strbuf_push_indent(buf, indent + 1)
-                strbuf_push_cstr(buf, "case _:")
-                strbuf_push_newline(buf)
-                is_label = True
+                default_idx = i
+                i = i + 1
             case _:
-                is_label = False
+                # Statement preceding the first label is unreachable in C.
+                i = i + 1
 
-        if not is_label:
-            # Statement preceding the first label is unreachable in C; skip it.
-            i = i + 1
-            continue
-
-        wrote_any: bool = False
-        if cur.body != nullptr:
-            emit_stmt(buf, cur.body, indent + 2)
-            wrote_any = True
-        i = i + 1
-        while i < n:
-            nxt: ptr[Stmt] = ptr(stmts[i])
-            done2: bool = False
-            match nxt.kind[0]:
-                case StmtKind.Case:
-                    done2 = True
-                case StmtKind.Default:
-                    done2 = True
-                case StmtKind.Break:
-                    i = i + 1
-                    done2 = True
-                case _:
-                    emit_stmt(buf, nxt, indent + 2)
-                    wrote_any = True
-                    i = i + 1
-            if done2:
-                break
-        if not wrote_any:
-            strbuf_push_indent(buf, indent + 2)
-            strbuf_push_cstr(buf, "pass")
-            strbuf_push_newline(buf)
+    if default_idx >= 0:
+        strbuf_push_indent(buf, indent + 1)
+        strbuf_push_cstr(buf, "case _:")
+        strbuf_push_newline(buf)
+        _emit_case_body(buf, stmts, n, default_idx, indent + 2)
 
 
 # =============================================================================
@@ -1581,6 +1963,8 @@ def sm_label_state(c: ptr[SMCtx], name: Span) -> i32:
         if span_eq(c.lab_names[i], name):
             return c.lab_states[i]
         i = i + 1
+    printf("SM label not found: %.*s\n", name.len, name.start)
+    fflush(nullptr)
     c.failed = 1
     return 0
 
@@ -1625,6 +2009,10 @@ def _sc_flags(s: ptr[Stmt]) -> i32:
         case StmtKind.Switch:
             f: i32 = _sc_flags(s.body)
             return (f & 1) | (f & 4)
+        case StmtKind.Case:
+            return _sc_flags(s.body)
+        case StmtKind.Default:
+            return _sc_flags(s.body)
         case StmtKind.If:
             return _sc_flags(s.body) | _sc_flags(s.else_body)
         case StmtKind.Block:
@@ -1691,6 +2079,10 @@ def sm_collect_hoist(c: ptr[SMCtx], s: ptr[Stmt]) -> void:
             sm_collect_hoist(c, s.body)
         case StmtKind.Switch:
             sm_collect_hoist(c, s.body)
+        case StmtKind.Case:
+            sm_collect_hoist(c, s.body)
+        case StmtKind.Default:
+            sm_collect_hoist(c, s.body)
         case StmtKind.Label:
             sm_collect_hoist(c, s.body)
         case StmtKind.Block:
@@ -1711,6 +2103,12 @@ def sm_collect_labels(c: ptr[SMCtx], s: ptr[Stmt]) -> void:
     match s.kind[0]:
         case StmtKind.Label:
             st: i32 = sm_alloc_block(c)
+            if s.label.len == 9 and _span_eq_cstr(s.label, "add_cstr1") != 0:
+                printf("collect label add_cstr1\n")
+                fflush(nullptr)
+            if s.label.len == 8 and _span_eq_cstr(s.label, "add_cstr") != 0:
+                printf("collect label add_cstr\n")
+                fflush(nullptr)
             if c.nlabels < MAX_SM_BLOCKS:
                 c.lab_names[c.nlabels] = s.label
                 c.lab_states[c.nlabels] = st
@@ -1738,7 +2136,7 @@ def sm_emit_decl_assign(c: ptr[SMCtx], cur: i32, s: ptr[Stmt]) -> void:
     b: ptr[StringBuffer] = ptr(c.blocks[cur])
     emit_pre_effects(b, s.expr, c.body_indent)
     strbuf_push_indent(b, c.body_indent)
-    strbuf_push_span(b, s.decl_name)
+    emit_identifier(b, s.decl_name)
     strbuf_push_cstr(b, " = ")
     emit_cond(b, s.expr, c.body_indent)
     strbuf_push_newline(b)
@@ -1779,6 +2177,18 @@ def sm_lower_one(c: ptr[SMCtx], s: ptr[Stmt],
             gst: i32 = sm_label_state(c, s.label)
             sm_emit_goto(c, cur, gst, c.body_indent)
             return -1
+        case StmtKind.Case:
+            # An empty fall-through case can appear as the body of a label that
+            # precedes a real case (e.g. `l: case A: case B: ...`).  It carries
+            # no statements of its own, so it just falls through to whatever
+            # follows in the same sequence.
+            if s.body != nullptr:
+                return sm_lower_one(c, s.body, cur, brk, cont)
+            return cur
+        case StmtKind.Default:
+            if s.body != nullptr:
+                return sm_lower_one(c, s.body, cur, brk, cont)
+            return cur
         case StmtKind.Break:
             if brk < 0:
                 c.failed = 1
@@ -1841,6 +2251,8 @@ def sm_lower_one(c: ptr[SMCtx], s: ptr[Stmt],
                 return cur
             return sm_lower_switch(c, s, cur, brk, cont)
         case _:
+            printf("SM unhandled stmt kind=%d\n", s.kind[0])
+            fflush(nullptr)
             c.failed = 1
             return cur
 
@@ -1937,7 +2349,7 @@ def sm_lower_for(c: ptr[SMCtx], s: ptr[Stmt],
         if s.init_expr != nullptr:
             emit_pre_effects(b, s.init_expr, c.body_indent)
             strbuf_push_indent(b, c.body_indent)
-            strbuf_push_span(b, s.decl_name)
+            emit_identifier(b, s.decl_name)
             strbuf_push_cstr(b, " = ")
             emit_cond(b, s.init_expr, c.body_indent)
             strbuf_push_newline(b)
@@ -2086,6 +2498,8 @@ def emit_state_machine(buf: ptr[StringBuffer], body: ptr[Stmt],
 
     entry: i32 = sm_alloc_block(c)
     sm_collect_labels(c, body)
+    printf("SM collected %d labels\n", c.nlabels)
+    fflush(nullptr)
     sm_collect_hoist(c, body)
 
     exit_blk: i32 = -1
@@ -2104,13 +2518,15 @@ def emit_state_machine(buf: ptr[StringBuffer], body: ptr[Stmt],
 
     ok: i8 = 1
     if c.failed != 0:
+        printf("SM failed\n")
+        fflush(nullptr)
         ok = 0
     else:
         # Prologue: hoisted locals, then the dispatch loop.
         h: i32 = 0
         while h < c.nhoist:
             strbuf_push_indent(buf, indent)
-            strbuf_push_span(buf, c.h_names[h])
+            emit_identifier(buf, c.h_names[h])
             strbuf_push_cstr(buf, ": ")
             emit_qualtype(buf, c.h_types[h])
             strbuf_push_newline(buf)
@@ -2261,7 +2677,7 @@ def emit_struct_class(buf: ptr[StringBuffer], name: Span, st: ptr[StructType]) -
     because C identifiers frequently start with `__`, which Python would
     name-mangle inside a class body (e.g. `__off_t` -> `_Cls__off_t`).
     """
-    strbuf_push_span(buf, name)
+    emit_identifier(buf, name)
     strbuf_push_cstr(buf, " = ")
     emit_anon_aggregate(buf, st, 0)
     strbuf_push_cstr(buf, "\n\n")
@@ -2293,7 +2709,7 @@ def emit_struct_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
 @compile
 def emit_union_type(buf: ptr[StringBuffer], name: Span, st: ptr[StructType]) -> void:
     """Emit a union as a type alias: Name = union["f1": T1, "f2": T2, ...]."""
-    strbuf_push_span(buf, name)
+    emit_identifier(buf, name)
     strbuf_push_cstr(buf, " = union[")
     if st == nullptr or st.field_count == 0:
         strbuf_push_cstr(buf, "\"_pad\": i8")
@@ -2305,7 +2721,7 @@ def emit_union_type(buf: ptr[StringBuffer], name: Span, st: ptr[StructType]) -> 
             field: ptr[FieldInfo] = ptr(st.fields[i])
             strbuf_push_char(buf, 34)  # '"'
             if not span_is_empty(field.name):
-                strbuf_push_span(buf, field.name)
+                emit_identifier(buf, field.name)
             else:
                 strbuf_push_cstr(buf, "_field")
                 strbuf_push_i32(buf, i)
@@ -2364,7 +2780,7 @@ def emit_enum_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
     
     # class Name:
     strbuf_push_cstr(buf, "class ")
-    strbuf_push_span(buf, decl.name)
+    emit_identifier(buf, decl.name)
     strbuf_push_cstr(buf, ":\n")
     
     # Enum values
@@ -2376,7 +2792,7 @@ def emit_enum_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
         while i < et.value_count:
             ev: ptr[EnumValue] = ptr(et.values[i])
             strbuf_push_indent(buf, 1)
-            strbuf_push_span(buf, ev.name)
+            emit_identifier(buf, ev.name)
             if ev.has_explicit_value != 0:
                 strbuf_push_cstr(buf, " = ")
                 strbuf_push_i64(buf, ev.value)
@@ -2421,7 +2837,7 @@ def emit_func_decl(buf: ptr[StringBuffer], decl: ptr[Decl], lib: ptr[i8]) -> voi
     
     # def name(params) -> ret:
     strbuf_push_cstr(buf, "def ")
-    strbuf_push_span(buf, decl.name)
+    emit_identifier(buf, decl.name)
     strbuf_push_char(buf, 40)  # '('
     
     # Parameters
@@ -2430,26 +2846,26 @@ def emit_func_decl(buf: ptr[StringBuffer], decl: ptr[Decl], lib: ptr[i8]) -> voi
         if i > 0:
             strbuf_push_cstr(buf, ", ")
         param: ptr[ParamInfo] = ptr(ft.params[i])
-        if not span_is_empty(param.name):
-            strbuf_push_span(buf, param.name)
+        if not span_is_empty(param.name) and _is_nullability_attr(param.name) == 0:
+            emit_identifier(buf, param.name)
         else:
             strbuf_push_cstr(buf, "arg")
             strbuf_push_i32(buf, i)
         strbuf_push_cstr(buf, ": ")
         emit_qualtype(buf, param.type)
         i = i + 1
-    
+
     # Variadic
     if ft.is_variadic != 0:
         if ft.param_count > 0:
             strbuf_push_cstr(buf, ", ")
         strbuf_push_cstr(buf, "*args")
-    
+
     strbuf_push_cstr(buf, ") -> ")
-    
+
     # Return type
     emit_qualtype(buf, ft.ret)
-    
+
     strbuf_push_cstr(buf, ":\n")
     strbuf_push_indent(buf, 1)
     strbuf_push_cstr(buf, "pass\n\n")
@@ -2477,7 +2893,7 @@ def emit_func_def(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
 
     strbuf_push_cstr(buf, "@compile\n")
     strbuf_push_cstr(buf, "def ")
-    strbuf_push_span(buf, decl.name)
+    emit_identifier(buf, decl.name)
     strbuf_push_char(buf, 40)  # '('
 
     i: i32 = 0
@@ -2485,8 +2901,8 @@ def emit_func_def(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
         if i > 0:
             strbuf_push_cstr(buf, ", ")
         param: ptr[ParamInfo] = ptr(ft.params[i])
-        if not span_is_empty(param.name):
-            strbuf_push_span(buf, param.name)
+        if not span_is_empty(param.name) and _is_nullability_attr(param.name) == 0:
+            emit_identifier(buf, param.name)
         else:
             strbuf_push_cstr(buf, "arg")
             strbuf_push_i32(buf, i)
@@ -2510,9 +2926,9 @@ def emit_func_def(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
 @compile
 def _emit_alias(buf: ptr[StringBuffer], name: Span, target: Span) -> void:
     """Emit `name = target`."""
-    strbuf_push_span(buf, name)
+    emit_identifier(buf, name)
     strbuf_push_cstr(buf, " = ")
-    strbuf_push_span(buf, target)
+    emit_identifier(buf, target)
     strbuf_push_cstr(buf, "\n\n")
 
 
@@ -2554,13 +2970,33 @@ def emit_typedef_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
                     return
                 if s != nullptr and not span_is_empty(s.name) and span_eq(s.name, decl.name):
                     return
+            case (CType.Enum, et):
+                if et != nullptr:
+                    if span_is_empty(et.name) or span_eq(et.name, decl.name):
+                        return
+            case (CType.Typedef, name):
+                if not span_is_empty(name) and span_eq(name, decl.name):
+                    return
             case _:
                 pass
 
-    strbuf_push_span(buf, decl.name)
+    emit_identifier(buf, decl.name)
     strbuf_push_cstr(buf, " = ")
     emit_qualtype(buf, decl.type)
-    strbuf_push_cstr(buf, "\n\n")
+    strbuf_push_cstr(buf, "\n")
+    if ty != nullptr:
+        match ty[0]:
+            case (CType.Func, _ft):
+                # Function-type aliases are used through pointer forward refs;
+                # registering them lets PythoC resolve ptr["Name"].
+                strbuf_push_cstr(buf, "mark_type_defined(\"")
+                emit_identifier(buf, decl.name)
+                strbuf_push_cstr(buf, "\", ")
+                emit_identifier(buf, decl.name)
+                strbuf_push_cstr(buf, ")\n")
+            case _:
+                pass
+    strbuf_push_cstr(buf, "\n")
 
 
 @compile
@@ -2659,6 +3095,31 @@ def emit_global_init(buf: ptr[StringBuffer], qt: ptr[QualType], init: ptr[Expr])
 
 
 @compile
+def _emit_var_aggregate_types(buf: ptr[StringBuffer], ty: ptr[QualType]) -> void:
+    """Emit struct/union types defined inline inside a variable's type.
+
+    A declaration like ``static struct S { ... } arr[N];`` defines ``S`` at
+    file scope but the parser does not always produce a separate struct decl.
+    Emitting the aggregate before the accessor makes the type name resolvable.
+    """
+    if ty == nullptr or ty.type == nullptr:
+        return
+    t: ptr[CType] = ty.type
+    match t[0]:
+        case (CType.Struct, st):
+            if st != nullptr and st.field_count > 0 and not span_is_empty(st.name):
+                emit_struct_class(buf, st.name, st)
+        case (CType.Union, st):
+            if st != nullptr and st.field_count > 0 and not span_is_empty(st.name):
+                emit_union_type(buf, st.name, st)
+        case (CType.Array, at):
+            if at != nullptr and at.elem != nullptr:
+                _emit_var_aggregate_types(buf, at.elem)
+        case _:
+            pass
+
+
+@compile
 def emit_var_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
     """Emit a file-scope variable as a static-backed accessor function.
 
@@ -2676,6 +3137,8 @@ def emit_var_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
     if decl.storage == STORAGE_EXTERN:
         return
 
+    # _emit_var_aggregate_types(buf, decl.type)
+
     strbuf_push_cstr(buf, "@compile\n")
     strbuf_push_cstr(buf, "def ")
     emit_global_accessor_name(buf, decl.name)
@@ -2686,10 +3149,26 @@ def emit_var_decl(buf: ptr[StringBuffer], decl: ptr[Decl]) -> void:
     strbuf_push_cstr(buf, "s: static[")
     emit_qualtype(buf, decl.type)
     strbuf_push_cstr(buf, "]")
-    # An aggregate without an initializer is left to PythoC's implicit
-    # zero-init; only emit a seed when there is one (or for scalars, which
-    # always need a constant zero).
-    if decl.init != nullptr or _qualtype_is_aggregate(decl.type) == 0:
+    # PythoC does not accept string literals as static initializers, so a
+    # pointer-to-char global seeded with a string is assigned at runtime.
+    # Static storage persists the value across calls, so this is equivalent
+    # for immutable string data.
+    is_string_init: i8 = 0
+    if decl.init != nullptr:
+        match decl.init.kind[0]:
+            case ExprKind.StringLit:
+                is_string_init = 1
+            case _:
+                pass
+    if is_string_init != 0:
+        strbuf_push_newline(buf)
+        strbuf_push_indent(buf, 1)
+        strbuf_push_cstr(buf, "s = ")
+        emit_expr(buf, decl.init)
+    elif decl.init != nullptr or _qualtype_is_aggregate(decl.type) == 0:
+        # An aggregate without an initializer is left to PythoC's implicit
+        # zero-init; only emit a seed when there is one (or for scalars, which
+        # always need a constant zero).
         strbuf_push_cstr(buf, " = ")
         emit_global_init(buf, decl.type, decl.init)
     strbuf_push_newline(buf)
@@ -2752,7 +3231,8 @@ def emit_module_header(buf: ptr[StringBuffer]) -> void:
     strbuf_push_cstr(buf, "void, char, nullptr, sizeof, typeof, struct, union, func, static,\n")
     strbuf_push_indent(buf, 1)
     strbuf_push_cstr(buf, "label, goto, goto_end\n")
-    strbuf_push_cstr(buf, ")\n\n")
+    strbuf_push_cstr(buf, ")\n")
+    strbuf_push_cstr(buf, "from pythoc.forward_ref import mark_type_defined\n\n")
 
 
 @compile

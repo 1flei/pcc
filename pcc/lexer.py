@@ -311,7 +311,13 @@ def lexer_read_char_literal(lex: LexerRef, token: TokenRef) -> void:
 
 @compile
 def lexer_read_string_literal(lex: LexerRef, token: TokenRef) -> void:
-    """Read string literal "..." (zero-copy)"""
+    """Read string literal "..." (zero-copy); concatenate adjacent string literals.
+
+    C translates adjacent string literals as a single string.  The lexer keeps
+    consuming whitespace-separated string literals so the resulting span covers
+    the whole sequence.  The backend emits the raw span, and Python also joins
+    adjacent string literals at compile time.
+    """
     token.start = lex.source + lex.pos
     start_pos: i32 = lex.pos
     lexer_advance(lex)  # skip opening "
@@ -328,6 +334,24 @@ def lexer_read_string_literal(lex: LexerRef, token: TokenRef) -> void:
                 lexer_advance(lex)  # skip escaped char
         else:
             lexer_advance(lex)
+
+    # Concatenate adjacent string literals.
+    while True:
+        lexer_skip_whitespace(lex)
+        if lexer_current(lex) != char('"'):
+            break
+        lexer_advance(lex)  # skip opening " of next literal
+        while lex.pos < lex.length:
+            c: i8 = lexer_current(lex)
+            if c == char('"'):
+                lexer_advance(lex)  # skip closing "
+                break
+            if c == char("\\"):
+                lexer_advance(lex)
+                if lex.pos < lex.length:
+                    lexer_advance(lex)
+            else:
+                lexer_advance(lex)
 
     token.length = lex.pos - start_pos
     token.type = TokenType.STRING

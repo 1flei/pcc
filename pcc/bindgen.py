@@ -27,7 +27,7 @@ from pythoc.libc.string import strlen
 from pythoc.std.vector import Vector
 
 from .c_parser import parse_declarations
-from .c_ast import decl_free, Decl, DeclKind, Span, span_eq
+from .c_ast import decl_free, Decl, DeclKind, Span, span_eq, STORAGE_INLINE
 from .pythoc_backend import (
     StringBuffer, strbuf_init, strbuf_destroy, strbuf_to_cstr,
     emit_module_header, emit_module_footer, emit_decl, strbuf_size
@@ -88,7 +88,18 @@ def _decl_selected(decl: ptr[Decl], mode: i32) -> i8:
         case _:
             is_type = 0
     if mode == _MODE_TYPES:
-        return is_type
+        # Interface modules export types and function prototypes.  Prototypes
+        # let callers import declarations without pulling in the implementation
+        # module, breaking import cycles between .c files that call each other.
+        if is_type != 0:
+            return 1
+        match decl.kind:
+            case DeclKind.Func:
+                if decl.body == nullptr:
+                    return 1
+            case _:
+                pass
+        return 0
     # Implementation modules emit everything originating in the .c: function
     # and variable definitions plus any file-local types.
     return 1
@@ -141,6 +152,24 @@ def _is_func_proto(decl: ptr[Decl]) -> i8:
     match decl.kind:
         case DeclKind.Func:
             if decl.body == nullptr:
+                return 1
+            return 0
+        case _:
+            return 0
+
+
+@compile
+def _is_inline_func(decl: ptr[Decl]) -> i8:
+    """Whether a declaration is a static/inline header helper.
+
+    Inline functions are not emitted as separate definitions (they are C
+    preprocessor/inline-expansion territory), so they must not appear in the
+    manifest either; otherwise the driver would try to import a name that no
+    module actually defines.
+    """
+    match decl.kind:
+        case DeclKind.Func:
+            if decl.storage == STORAGE_INLINE:
                 return 1
             return 0
         case _:
@@ -391,7 +420,8 @@ def dump_manifest_file(input_path: ptr[i8], output_path: ptr[i8]) -> i32:
         free(source)
         return 1
     for decl_prf, decl in parse_declarations(source):
-        _write_manifest_line(fp, decl)
+        if _is_inline_func(decl) == 0:
+            _write_manifest_line(fp, decl)
         decl_free(decl_prf, decl)
     fclose(fp)
     free(source)

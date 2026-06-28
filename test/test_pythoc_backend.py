@@ -463,10 +463,11 @@ int main(int argc, char* argv[])
         strbuf_destroy(ptr(buf))
         return 1
     
-    # Verify typedef usage in function signatures
-    # Functions should use treeNode (typedef name) in their signatures
-    if strstr(result, "ptr[treeNode]") == ptr[i8](0):
-        printf("FAIL: Expected 'ptr[treeNode]' in function signatures\n")
+    # Verify typedef usage in function signatures.
+    # Typedef pointees are emitted as quoted forward refs so incomplete
+    # typedef'd structs can be referenced before their full definition.
+    if strstr(result, "ptr[\"treeNode\"]") == ptr[i8](0):
+        printf("FAIL: Expected 'ptr[\"treeNode\"]' in function signatures\n")
         strbuf_destroy(ptr(buf))
         return 1
     
@@ -855,6 +856,134 @@ int pick(int k, int x) {
 
 
 @compile
+def test_comma_operator() -> i32:
+    """C comma operator is lowered via pre-effects / residual value.
+
+    It must work in statement position, in assignment RHS, in loop conditions,
+    and when the callee itself is a comma expression (the TCC_SET_STATE pattern).
+    """
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+int g_seq;
+int foo(void) { return 1; }
+int bar(int x) { return x; }
+
+int f(int n) {
+    int i = 0;
+    int x = 0;
+
+    i = (foo(), n);
+    while (i++, i < 10)
+        x = x + i;
+    if ((foo(), n) > 0)
+        x = x + 1;
+    (foo(), bar(n));
+    return x;
+}
+
+int g(int n) {
+    return (foo(), bar)(n);
+}
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Comma Operator ===\n%s\n", result)
+
+    # Statement-level comma: both sides must be emitted as statements.
+    if strstr(result, "foo()") == ptr[i8](0):
+        printf("FAIL: statement-level comma lhs not emitted\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    # Assignment RHS with comma must not leak unsupported.
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: comma expression leaked __pcc_unsupported__\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    # While condition with side effects must lower to while True + early break.
+    if strstr(result, "while True:") == ptr[i8](0):
+        printf("FAIL: comma in while condition not lowered to while True\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    # Callee is a comma expression: function call must remain valid.
+    if strstr(result, "(foo(), bar)(n)") != ptr[i8](0):
+        printf("FAIL: comma callee was not lowered correctly\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_comma_operator\n\n")
+    return 0
+
+
+@compile
+def test_string_concatenation() -> i32:
+    """Adjacent C string literals are concatenated into one token.
+
+    This appears in real code such as tinycc's `printf("...", "" "libtcc1.a");`
+    and multi-line string initializers.  The lexer must merge them so the call
+    arguments parse correctly and the emitted Python stays syntactically valid.
+    """
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+static void f(void) {
+    printf("prefix" "suffix");
+    printf("a"
+           "b");
+}
+static const char msg[] = "hello " "world";
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== String Concatenation ===\n%s\n", result)
+
+    # Both same-line and multi-line adjacent strings must lower to valid
+    # Python string literals.  The exact quote boundaries do not matter as
+    # long as the concatenated content is present and the module compiles.
+    if strstr(result, "prefix") == ptr[i8](0):
+        printf("FAIL: same-line string concat missing 'prefix'\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "suffix") == ptr[i8](0):
+        printf("FAIL: same-line string concat missing 'suffix'\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "hello") == ptr[i8](0):
+        printf("FAIL: global string concat missing 'hello'\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "world") == ptr[i8](0):
+        printf("FAIL: global string concat missing 'world'\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    # Multi-line adjacent strings must not introduce indentation errors.
+    if strstr(result, "__pcc_unsupported__") != ptr[i8](0):
+        printf("FAIL: string concat lowered as unsupported\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_string_concatenation\n\n")
+    return 0
+
+
+@compile
 def test_storage_class_hints() -> i32:
     """register/auto are ignorable storage-class hints, not identifiers.
 
@@ -907,6 +1036,51 @@ int f(register int a) {
 
 
 @compile
+def test_python_keyword_identifiers() -> i32:
+    """C identifiers that collide with Python keywords are emitted with a
+    trailing underscore so the generated module is syntactically valid and
+    every reference stays consistent."""
+    buf: StringBuffer
+    strbuf_init(ptr(buf))
+
+    emit_module_header(ptr(buf))
+
+    source: ptr[i8] = """
+struct class {
+    int in;
+};
+int def(struct class *in, int as);
+"""
+    for decl_prf, decl in parse_declarations(source):
+        emit_decl(ptr(buf), decl, "c")
+        decl_free(decl_prf, decl)
+
+    result: ptr[i8] = strbuf_to_cstr(ptr(buf))
+    printf("=== Python Keyword Identifiers ===\n%s\n", result)
+
+    if strstr(result, "class_ = struct[") == ptr[i8](0):
+        printf("FAIL: struct tag 'class' not mangled\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "\"in_\": i32") == ptr[i8](0):
+        printf("FAIL: field 'in' not mangled in struct key\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "def_(in_: ptr[\"class_\"], as_: i32) -> i32") == ptr[i8](0):
+        printf("FAIL: function/parameter keyword identifiers not mangled\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+    if strstr(result, "def def(") != ptr[i8](0) or strstr(result, ", in: ptr") != ptr[i8](0):
+        printf("FAIL: raw keyword identifiers survived in output\n")
+        strbuf_destroy(ptr(buf))
+        return 1
+
+    strbuf_destroy(ptr(buf))
+    printf("PASS: test_python_keyword_identifiers\n\n")
+    return 0
+
+
+@compile
 def main() -> i32:
     printf("=== Pythoc Backend Tests ===\n\n")
     
@@ -927,7 +1101,10 @@ def main() -> i32:
     failed = failed + test_goto_lowering()
     failed = failed + test_goto_state_machine()
     failed = failed + test_goto_into_switch()
+    failed = failed + test_comma_operator()
+    failed = failed + test_string_concatenation()
     failed = failed + test_storage_class_hints()
+    failed = failed + test_python_keyword_identifiers()
     
     if failed > 0:
         printf("\n%d test(s) FAILED!\n", failed)

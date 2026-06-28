@@ -93,8 +93,8 @@ class ParseError:
 # Parser State
 # =============================================================================
 
-MAX_PARAMS = 32
-MAX_FIELDS = 64
+MAX_PARAMS = 64
+MAX_FIELDS = 256
 MAX_ENUM_VALUES = 256
 MAX_ERRORS = 16
 MAX_INIT_LIST_ELEMS = 64
@@ -2238,6 +2238,14 @@ def parse_statement(p: ParserRef, prfs: ParserProofs) -> struct[ptr[Stmt], Parse
             return s, prfs
 
         case _:
+            # Storage-class specifiers can precede a local declaration.
+            # For now static/extern locals are lowered as ordinary locals; true
+            # static storage duration will be added once the rest of the pipeline
+            # is stable.
+            if parser_match(p, TokenType.STATIC) or parser_match(p, TokenType.EXTERN):
+                prfs = parser_advance(p, prfs)
+                return parse_local_decl(p, prfs)
+
             # Check if this looks like a local variable declaration (type name at stmt position)
             if parser_is_typename(p, p.current):
                 return parse_local_decl(p, prfs)
